@@ -794,6 +794,10 @@ requires-dist = [
 name = "unified-inbox-workspace"
 version = "0.1.0"
 source = { virtual = "." }
+dependencies = [
+    { name = "unified-inbox-core" },
+    { name = "unified-inbox-discord-adapter" },
+]
 
 [package.dev-dependencies]
 dev = [
@@ -804,6 +808,10 @@ dev = [
 ]
 
 [package.metadata]
+requires-dist = [
+    { name = "unified-inbox-core", editable = "core" },
+    { name = "unified-inbox-discord-adapter", editable = "discord-adapter" },
+]
 
 [package.metadata.requires-dev]
 dev = [

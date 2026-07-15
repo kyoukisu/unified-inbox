@@ -2,6 +2,14 @@
 name = "unified-inbox-workspace"
 version = "0.1.0"
 requires-python = ">=3.13"
+dependencies = [
+  "unified-inbox-core",
+  "unified-inbox-discord-adapter",
+]
+
+[tool.uv.sources]
+unified-inbox-core = { workspace = true }
+unified-inbox-discord-adapter = { workspace = true }
 
 [tool.uv.workspace]
 members = ["core", "discord-adapter"]

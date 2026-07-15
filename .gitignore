@@ -1,0 +1,22 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.pyright/
+.ruff_cache/
+node_modules/
+coverage.xml
+htmlcov/
+
+# Local credentials. Keep the directory, never its contents.
+secrets/*
+!secrets/.gitkeep
+
+# Optional local runtime state when not using named volumes.
+state/
+
+# Editor/OS files
+.idea/
+.vscode/
+.DS_Store

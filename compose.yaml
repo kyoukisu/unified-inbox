@@ -1,0 +1,146 @@
+name: unified-inbox
+
+x-common: &common
+  restart: unless-stopped
+  init: true
+  network_mode: host
+  read_only: true
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,size=64m
+  cap_drop: [ALL]
+  security_opt:
+    - no-new-privileges:true
+
+services:
+  core:
+    <<: *common
+    build:
+      context: .
+      dockerfile: core/Dockerfile
+      network: host
+    environment:
+      CORE_BIND: 127.0.0.1
+      CORE_PORT: "8080"
+      CORE_DATABASE: /data/unified-inbox.sqlite3
+      CORE_INTERNAL_TOKEN_FILE: /run/secrets/internal_api_token
+      TELEGRAM_BOT_TOKEN_FILE: /run/secrets/telegram_bot_token
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:?set TELEGRAM_CHAT_ID in .env}
+      TELEGRAM_ALLOWED_USER_ID: ${TELEGRAM_ALLOWED_USER_ID:?set TELEGRAM_ALLOWED_USER_ID in .env}
+      TELEGRAM_POLL_TIMEOUT: ${TELEGRAM_POLL_TIMEOUT:-30}
+      CORE_LOG_LEVEL: ${CORE_LOG_LEVEL:-INFO}
+      MAX_IMAGE_BYTES: ${MAX_IMAGE_BYTES:-20971520}
+      DISCORD_ADAPTER_URL: http://127.0.0.1:8081
+      STEAM_ADAPTER_URL: http://127.0.0.1:8082
+    secrets:
+      - telegram_bot_token
+      - internal_api_token
+    volumes:
+      - core-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 10s
+
+  discord-adapter:
+    <<: *common
+    build:
+      context: .
+      dockerfile: discord-adapter/Dockerfile
+      network: host
+    environment:
+      ADAPTER_BIND: 127.0.0.1
+      ADAPTER_PORT: "8081"
+      ADAPTER_LOG_LEVEL: ${ADAPTER_LOG_LEVEL:-INFO}
+      CORE_URL: http://127.0.0.1:8080
+      CORE_INTERNAL_TOKEN_FILE: /run/secrets/internal_api_token
+      DISCORD_USER_TOKEN_FILE: /run/secrets/discord_user_token
+      MAX_IMAGE_BYTES: ${MAX_IMAGE_BYTES:-20971520}
+    secrets:
+      - discord_user_token
+      - internal_api_token
+    depends_on:
+      core:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/health', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 20s
+
+  steam-adapter:
+    <<: *common
+    build:
+      context: .
+      dockerfile: steam-adapter/Dockerfile
+      network: host
+    environment:
+      ADAPTER_BIND: 127.0.0.1
+      ADAPTER_PORT: "8082"
+      ADAPTER_LOG_LEVEL: ${ADAPTER_LOG_LEVEL:-INFO}
+      CORE_URL: http://127.0.0.1:8080
+      CORE_INTERNAL_TOKEN_FILE: /run/secrets/internal_api_token
+      STEAM_REFRESH_TOKEN_FILE: /data/refresh-token
+      MAX_IMAGE_BYTES: ${MAX_IMAGE_BYTES:-20971520}
+    secrets:
+      - internal_api_token
+    volumes:
+      - steam-data:/data
+    depends_on:
+      core:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "src/healthcheck.mjs"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 20s
+
+  steam-auth:
+    build:
+      context: .
+      dockerfile: steam-adapter/Dockerfile
+      network: host
+    profiles: ["tools"]
+    init: true
+    command: ["node", "src/auth.mjs"]
+    environment:
+      STEAM_AUTH_MODE: ${STEAM_AUTH_MODE:-qr}
+      STEAM_REFRESH_TOKEN_FILE: /data/refresh-token
+      STEAM_QR_FILE: /auth/steam-login-qr.png
+      STEAM_GUARD_CODE_FILE: /auth/steam-guard-code
+      STEAM_ACCOUNT_NAME_FILE: /run/secrets/steam_account_name
+      STEAM_PASSWORD_FILE: /run/secrets/steam_password
+    secrets:
+      - steam_account_name
+      - steam_password
+    volumes:
+      - steam-data:/data
+      - ./state/steam-auth:/auth
+    stdin_open: true
+    tty: true
+    network_mode: host
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  core-data:
+  steam-data:
+
+secrets:
+  telegram_bot_token:
+    file: ./secrets/telegram_bot_token
+  discord_user_token:
+    file: ./secrets/discord_user_token
+  internal_api_token:
+    file: ./secrets/internal_api_token
+  steam_account_name:
+    file: ./secrets/steam_account_name
+  steam_password:
+    file: ./secrets/steam_password

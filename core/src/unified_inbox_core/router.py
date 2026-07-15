@@ -26,9 +26,11 @@ class Router:
         telegram_chat_id: int,
         telegram_allowed_user_id: int,
         max_image_bytes: int,
+        outbox_telegram: TelegramClient | None = None,
     ) -> None:
         self._db = db
         self._telegram = telegram
+        self._outbox_telegram = outbox_telegram or telegram
         self._adapters = adapters
         self._session = session
         self._chat_id = telegram_chat_id
@@ -42,6 +44,10 @@ class Router:
 
         try:
             conversation = await self._resolve_conversation(event)
+            relay = (
+                self._outbox_telegram if event.direction == "outbound_native" else self._telegram
+            )
+
             reply_id = None
             if event.reply_to_message_id is not None:
                 reply_id = self._db.telegram_message_for_external(
@@ -60,7 +66,7 @@ class Router:
                         self._max_image_bytes,
                     )
                     sent_ids.append(
-                        await self._telegram.send_photo(
+                        await relay.send_photo(
                             self._chat_id,
                             conversation.telegram_topic_id,
                             content,
@@ -84,7 +90,7 @@ class Router:
                         fallback = f"{remaining_text}\n{attachment.url}"
                         remaining_text = None
                     sent_ids.append(
-                        await self._telegram.send_text(
+                        await relay.send_text(
                             self._chat_id,
                             conversation.telegram_topic_id,
                             fallback,
@@ -94,7 +100,7 @@ class Router:
 
             if remaining_text:
                 sent_ids.append(
-                    await self._telegram.send_text(
+                    await relay.send_text(
                         self._chat_id,
                         conversation.telegram_topic_id,
                         remaining_text,
@@ -109,7 +115,7 @@ class Router:
                 conversation.id,
                 event.message_id,
                 sent_ids[0],
-                "inbound",
+                "outbound" if event.direction == "outbound_native" else "inbound",
             )
             self._db.finish_event(event.platform, event.event_id)
             return True

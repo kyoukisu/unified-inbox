@@ -29,6 +29,11 @@ class CoreApplication:
             settings.telegram_token,
             settings.max_image_bytes,
         )
+        self._outbox_telegram = TelegramClient(
+            self._session,
+            settings.telegram_outbox_token,
+            settings.max_image_bytes,
+        )
         self._adapters = AdapterClient(
             self._session,
             settings.internal_token,
@@ -45,12 +50,18 @@ class CoreApplication:
             settings.telegram_chat_id,
             settings.telegram_allowed_user_id,
             settings.max_image_bytes,
+            self._outbox_telegram,
         )
         self._poll_task: asyncio.Task[None] | None = None
 
     async def start(self) -> None:
         me = await self._telegram.get_me()
-        _LOGGER.info("Telegram bot connected as @%s", me.get("username"))
+        outbox_me = await self._outbox_telegram.get_me()
+        _LOGGER.info(
+            "Telegram bots connected as @%s and @%s",
+            me.get("username"),
+            outbox_me.get("username"),
+        )
         await self._telegram.initialize_polling()
         self._poll_task = asyncio.create_task(self._poll_telegram(), name="telegram-poll")
 

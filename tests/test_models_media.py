@@ -21,6 +21,24 @@ def test_inbound_event_requires_content() -> None:
         )
 
 
+def test_inbound_event_rejects_unknown_direction() -> None:
+    with pytest.raises(ValueError, match="direction must be"):
+        InboundEvent.from_mapping(
+            {
+                "platform": "discord",
+                "event_id": "event-2",
+                "conversation_id": "chat-2",
+                "display_name": "Bob",
+                "sender_id": "bob",
+                "sender_name": "Bob",
+                "message_id": "message-2",
+                "text": "hello",
+                "attachments": [],
+                "direction": "sideways",
+            }
+        )
+
+
 def test_media_url_allowlist_blocks_credentials_ports_and_lookalikes() -> None:
     assert is_allowed_media_url(
         "discord",

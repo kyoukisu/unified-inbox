@@ -17,6 +17,19 @@ const client = new SteamUser({ autoRelogin: true, renewRefreshTokens: true });
 const imageUploader = new SteamImageUploader(client);
 let connected = false;
 let accountId = null;
+const bridgeMessageIds = new Set();
+const bridgeImageUrls = new Set();
+
+function rememberBridgeValue(values, value) {
+  if (values.size >= 2048) values.delete(values.values().next().value);
+  values.add(value);
+}
+
+function consumeBridgeValue(values, value) {
+  if (!values.has(value)) return false;
+  values.delete(value);
+  return true;
+}
 
 function log(level, message, error = null) {
   const line = `${new Date().toISOString()} ${level} ${message}`;
@@ -45,14 +58,24 @@ client.on("refreshToken", async (token) => {
 });
 
 client.chat.on("friendMessage", (message) => {
-  void handleFriendMessage(message);
+  void handleFriendMessage(message, "inbound");
+});
+client.chat.on("friendMessageEcho", (message) => {
+  setTimeout(() => void handleFriendMessage(message, "outbound_native"), 2000);
 });
 
-async function handleFriendMessage(message) {
+async function handleFriendMessage(message, direction) {
   const steamId = message.steamid_friend.toString();
   const identity = messageIdentity(message);
   const { text, attachments } = parseFriendMessage(message);
   if (!text && attachments.length === 0) return;
+  if (
+    direction === "outbound_native"
+    && (
+      consumeBridgeValue(bridgeMessageIds, identity)
+      || attachments.some((attachment) => consumeBridgeValue(bridgeImageUrls, attachment.url))
+    )
+  ) return;
 
   let persona = client.users[steamId];
   if (!persona) {
@@ -69,12 +92,13 @@ async function handleFriendMessage(message) {
     event_id: `${steamId}:${identity}`,
     conversation_id: steamId,
     display_name: displayName,
-    sender_id: steamId,
-    sender_name: displayName,
+    sender_id: direction === "outbound_native" ? (accountId ?? "self") : steamId,
+    sender_name: direction === "outbound_native" ? "You" : displayName,
     message_id: identity,
     text,
     reply_to_message_id: null,
     attachments,
+    direction,
   });
 }
 
@@ -112,6 +136,7 @@ async function sendOutbound(metadata, image) {
   let imageUrl = null;
   if (image) {
     imageUrl = await imageUploader.sendImageToUser(metadata.conversation_id, image);
+    rememberBridgeValue(bridgeImageUrls, imageUrl);
   }
 
   let messageId = imageUrl ? `image:${imageUrl}` : null;
@@ -120,6 +145,7 @@ async function sendOutbound(metadata, image) {
       containsBbCode: false,
     });
     messageId = messageIdentity(sent);
+    rememberBridgeValue(bridgeMessageIds, messageId);
   }
   if (!messageId) throw new Error("outbound request contains neither text nor image");
   await deliveries.set(metadata.idempotency_key, messageId);

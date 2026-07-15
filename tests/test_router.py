@@ -111,6 +111,92 @@ async def test_inbound_text_creates_one_topic_and_deduplicates(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
+async def test_native_outbound_uses_outbox_only_for_persisted_conversation(
+    tmp_path: Path,
+) -> None:
+    db = Database(tmp_path / "bridge.sqlite3")
+    conversation = db.create_conversation("discord", "dm-123", "Bob", 77)
+    inbox = FakeTelegram()
+    outbox = FakeTelegram()
+    adapters = FakeAdapters()
+    async with aiohttp.ClientSession() as session:
+        router = Router(
+            db,
+            cast(TelegramClient, inbox),
+            cast(AdapterClient, adapters),
+            session,
+            -100123,
+            999,
+            1024,
+            cast(TelegramClient, outbox),
+        )
+        event = InboundEvent.from_mapping(
+            {
+                "platform": "discord",
+                "event_id": "self-message-1",
+                "conversation_id": "dm-123",
+                "display_name": "Bob",
+                "sender_id": "me",
+                "sender_name": "You",
+                "message_id": "self-message-1",
+                "text": "sent from Windows",
+                "attachments": [],
+                "direction": "outbound_native",
+            }
+        )
+
+        assert await router.handle_inbound(event) is True
+
+    assert inbox.created_topics == []
+    assert inbox.sent_text == []
+    assert outbox.created_topics == []
+    assert outbox.sent_text == [(77, "sent from Windows")]
+    assert db.telegram_message_for_external(conversation.id, "self-message-1") == 502
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_native_outbound_creates_persisted_native_conversation(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bridge.sqlite3")
+    inbox = FakeTelegram()
+    outbox = FakeTelegram()
+    adapters = FakeAdapters()
+    async with aiohttp.ClientSession() as session:
+        router = Router(
+            db,
+            cast(TelegramClient, inbox),
+            cast(AdapterClient, adapters),
+            session,
+            -100123,
+            999,
+            1024,
+            cast(TelegramClient, outbox),
+        )
+        event = InboundEvent.from_mapping(
+            {
+                "platform": "steam",
+                "event_id": "unknown-self-message",
+                "conversation_id": "unknown-chat",
+                "display_name": "Unknown",
+                "sender_id": "me",
+                "sender_name": "You",
+                "message_id": "unknown-self-message",
+                "text": "started from native client",
+                "attachments": [],
+                "direction": "outbound_native",
+            }
+        )
+
+        assert await router.handle_inbound(event) is True
+
+    assert db.get_conversation("steam", "unknown-chat") is not None
+    assert inbox.created_topics == ["🎮 Steam · Unknown"]
+    assert inbox.sent_text == []
+    assert outbox.sent_text == [(77, "started from native client")]
+    db.close()
+
+
+@pytest.mark.asyncio
 async def test_authorized_telegram_message_routes_to_external_adapter(tmp_path: Path) -> None:
     db = Database(tmp_path / "bridge.sqlite3")
     db.create_conversation("discord", "dm-123", "Bob", 77)

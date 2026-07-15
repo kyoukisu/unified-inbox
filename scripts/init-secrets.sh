@@ -14,7 +14,7 @@ print(secrets.token_urlsafe(48))
 PY
 fi
 
-for name in telegram_bot_token discord_user_token steam_account_name steam_password; do
+for name in telegram_bot_token telegram_outbox_bot_token discord_user_token steam_account_name steam_password; do
   if [[ ! -e "$secrets_dir/$name" ]]; then
     install -m 600 /dev/null "$secrets_dir/$name"
   fi
@@ -22,4 +22,4 @@ done
 
 chmod 600 "$secrets_dir"/*
 printf 'Secret files are ready in %s\n' "$secrets_dir"
-printf 'Fill Telegram/Discord tokens and optional Steam credential files.\n'
+printf 'Fill Telegram inbox/outbox and Discord tokens plus optional Steam credential files.\n'

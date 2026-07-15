@@ -4,7 +4,9 @@ A Telegram forum-supergroup used as the UI for Steam and Discord direct messages
 
 ## Architecture
 
-- `core`: Python Telegram Bot API router, SQLite source of truth, ACL and message/topic mapping.
+- `core`: Python Telegram Bot API router, SQLite source of truth, ACL and persistent message/topic mapping.
+- The Inbox bot relays peer messages; the Outbox bot mirrors messages sent from native Discord/Steam clients into existing topics.
+- Native inbound messages and native self-messages can create persisted topics. Telegram has no command or flow for starting a new external DM.
 - `discord-adapter`: isolated Python `discord.py-self` client.
 - `steam-adapter`: minimal isolated Node.js Steam protocol process.
 - Containers use host networking for reliable egress, but bind only to `127.0.0.1:8080-8082`.
@@ -18,7 +20,7 @@ just init
 just lock
 ```
 
-Fill `secrets/telegram_bot_token`, `secrets/discord_user_token`, and the numeric values in `.env`.
+Fill `secrets/telegram_bot_token`, `secrets/telegram_outbox_bot_token`, `secrets/discord_user_token`, and the numeric values in `.env`. Add both Telegram bots to the forum group; Inbox needs topic-management rights and Outbox needs permission to post in topics.
 Create the Steam refresh token interactively. QR mode is the default; credentials mode additionally reads `secrets/steam_account_name` and `secrets/steam_password`:
 
 ```bash

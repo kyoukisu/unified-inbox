@@ -38,6 +38,7 @@ class Settings:
     database_path: Path
     internal_token: str
     telegram_token: str
+    telegram_outbox_token: str
     telegram_chat_id: int
     telegram_allowed_user_id: int
     telegram_poll_timeout: int
@@ -54,6 +55,7 @@ class Settings:
             database_path=Path(os.environ.get("CORE_DATABASE", "/data/unified-inbox.sqlite3")),
             internal_token=_read_secret("CORE_INTERNAL_TOKEN_FILE"),
             telegram_token=_read_secret("TELEGRAM_BOT_TOKEN_FILE"),
+            telegram_outbox_token=_read_secret("TELEGRAM_OUTBOX_BOT_TOKEN_FILE"),
             telegram_chat_id=_required_int("TELEGRAM_CHAT_ID"),
             telegram_allowed_user_id=_required_int("TELEGRAM_ALLOWED_USER_ID"),
             telegram_poll_timeout=int(os.environ.get("TELEGRAM_POLL_TIMEOUT", "30")),

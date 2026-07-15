@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Literal, cast
 
 Platform = Literal["discord", "steam"]
+Direction = Literal["inbound", "outbound_native"]
 
 
 def _required_string(data: Mapping[str, object], key: str) -> str:
@@ -54,6 +55,7 @@ class InboundEvent:
     text: str | None
     reply_to_message_id: str | None
     attachments: tuple[Attachment, ...]
+    direction: Direction
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, object]) -> InboundEvent:
@@ -76,6 +78,10 @@ class InboundEvent:
         if text is None and not attachments:
             raise ValueError("event must contain text or at least one attachment")
 
+        direction_value = data.get("direction", "inbound")
+        if direction_value not in ("inbound", "outbound_native"):
+            raise ValueError("direction must be inbound or outbound_native")
+
         return cls(
             platform=platform_value,
             event_id=_required_string(data, "event_id"),
@@ -87,6 +93,7 @@ class InboundEvent:
             text=text,
             reply_to_message_id=_optional_string(data, "reply_to_message_id"),
             attachments=tuple(attachments),
+            direction=direction_value,
         )
 
 

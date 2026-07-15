@@ -24,6 +24,7 @@ services:
       CORE_DATABASE: /data/unified-inbox.sqlite3
       CORE_INTERNAL_TOKEN_FILE: /run/secrets/internal_api_token
       TELEGRAM_BOT_TOKEN_FILE: /run/secrets/telegram_bot_token
+      TELEGRAM_OUTBOX_BOT_TOKEN_FILE: /run/secrets/telegram_outbox_bot_token
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:?set TELEGRAM_CHAT_ID in .env}
       TELEGRAM_ALLOWED_USER_ID: ${TELEGRAM_ALLOWED_USER_ID:?set TELEGRAM_ALLOWED_USER_ID in .env}
       TELEGRAM_POLL_TIMEOUT: ${TELEGRAM_POLL_TIMEOUT:-30}
@@ -33,6 +34,7 @@ services:
       STEAM_ADAPTER_URL: http://127.0.0.1:8082
     secrets:
       - telegram_bot_token
+      - telegram_outbox_bot_token
       - internal_api_token
     volumes:
       - core-data:/data
@@ -136,6 +138,8 @@ volumes:
 secrets:
   telegram_bot_token:
     file: ./secrets/telegram_bot_token
+  telegram_outbox_bot_token:
+    file: ./secrets/telegram_outbox_bot_token
   discord_user_token:
     file: ./secrets/discord_user_token
   internal_api_token:

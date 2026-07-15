@@ -28,6 +28,8 @@ class DiscordBridgeClient(discord.Client):
         self._core_url = core_url
         self._internal_token = internal_token
         self._delivery_tasks: set[asyncio.Task[None]] = set()
+        self._bridge_message_ids: set[int] = set()
+        self._bridge_nonces: set[int] = set()
 
     async def on_ready(self) -> None:
         if self.user is None:
@@ -35,8 +37,28 @@ class DiscordBridgeClient(discord.Client):
         _LOGGER.info("Discord user session connected as %s (%s)", self.user, self.user.id)
 
     async def on_message(self, message: discord.Message) -> None:
-        if self.user is None or message.author.id == self.user.id or message.guild is not None:
+        if self.user is None or message.guild is not None:
             return
+
+        direction = "outbound_native" if message.author.id == self.user.id else "inbound"
+        task = asyncio.create_task(
+            self._relay_message(message, direction),
+            name=f"discord-{direction}-{message.id}",
+        )
+        self._delivery_tasks.add(task)
+        task.add_done_callback(self._delivery_tasks.discard)
+
+    async def _relay_message(self, message: discord.Message, direction: str) -> None:
+        if direction == "outbound_native":
+            await asyncio.sleep(1)
+            nonce = message.nonce
+            if message.id in self._bridge_message_ids or (
+                isinstance(nonce, int) and nonce in self._bridge_nonces
+            ):
+                self._bridge_message_ids.discard(message.id)
+                if isinstance(nonce, int):
+                    self._bridge_nonces.discard(nonce)
+                return
 
         attachments: list[dict[str, object]] = []
         for attachment in message.attachments:
@@ -59,25 +81,20 @@ class DiscordBridgeClient(discord.Client):
         if message.reference is not None and message.reference.message_id is not None:
             reply_to = str(message.reference.message_id)
 
-        display_name = self._conversation_name(message)
         payload: dict[str, object] = {
             "platform": "discord",
             "event_id": str(message.id),
             "conversation_id": str(message.channel.id),
-            "display_name": display_name,
+            "display_name": self._conversation_name(message),
             "sender_id": str(message.author.id),
             "sender_name": message.author.display_name,
             "message_id": str(message.id),
             "text": text,
             "reply_to_message_id": reply_to,
             "attachments": attachments,
+            "direction": direction,
         }
-        task = asyncio.create_task(
-            self._deliver_to_core(payload),
-            name=f"discord-inbound-{message.id}",
-        )
-        self._delivery_tasks.add(task)
-        task.add_done_callback(self._delivery_tasks.discard)
+        await self._deliver_to_core(payload)
 
     async def close(self) -> None:
         for task in self._delivery_tasks:
@@ -121,6 +138,7 @@ class DiscordBridgeClient(discord.Client):
             byteorder="big",
             signed=False,
         )
+        self._remember_bridge_value(self._bridge_nonces, nonce)
         if file is not None and reference is not None:
             sent = await channel.send(
                 content=text,
@@ -140,7 +158,14 @@ class DiscordBridgeClient(discord.Client):
             )
         else:
             sent = await channel.send(content=text, nonce=nonce)
+        self._remember_bridge_value(self._bridge_message_ids, sent.id)
         return str(sent.id)
+
+    @staticmethod
+    def _remember_bridge_value(values: set[int], value: int) -> None:
+        if len(values) >= 2048:
+            values.pop()
+        values.add(value)
 
     async def _deliver_to_core(self, payload: dict[str, object]) -> None:
         headers = {"Authorization": f"Bearer {self._internal_token}"}

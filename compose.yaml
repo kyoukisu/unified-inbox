@@ -18,6 +18,8 @@ services:
       context: .
       dockerfile: core/Dockerfile
       network: host
+      args:
+        APP_UID: ${APP_UID:-1000}
     environment:
       CORE_BIND: 127.0.0.1
       CORE_PORT: "8080"
@@ -51,6 +53,8 @@ services:
       context: .
       dockerfile: discord-adapter/Dockerfile
       network: host
+      args:
+        APP_UID: ${APP_UID:-1000}
     environment:
       ADAPTER_BIND: 127.0.0.1
       ADAPTER_PORT: "8081"
@@ -78,6 +82,8 @@ services:
       context: .
       dockerfile: steam-adapter/Dockerfile
       network: host
+      args:
+        APP_UID: ${APP_UID:-1000}
     environment:
       ADAPTER_BIND: 127.0.0.1
       ADAPTER_PORT: "8082"
@@ -105,6 +111,8 @@ services:
       context: .
       dockerfile: steam-adapter/Dockerfile
       network: host
+      args:
+        APP_UID: ${APP_UID:-1000}
     profiles: ["tools"]
     init: true
     command: ["node", "src/auth.mjs"]

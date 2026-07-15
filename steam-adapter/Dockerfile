@@ -1,10 +1,13 @@
 FROM node:22.22.0-bookworm-slim
 
+ARG APP_UID=1000
+
 ENV NODE_ENV=production
 WORKDIR /app
 
 COPY steam-adapter/package.json steam-adapter/package-lock.json ./
-RUN npm ci --omit=dev --ignore-scripts \
+RUN if [ "${APP_UID}" != "1000" ]; then usermod --uid "${APP_UID}" node; fi \
+    && npm ci --omit=dev --ignore-scripts \
     && npm cache clean --force \
     && mkdir -p /data \
     && chown node:node /data

@@ -1,0 +1,25 @@
+[Unit]
+Description=Telegram unified inbox bridge
+Wants=network-online.target
+After=docker.service network-online.target
+Requires=docker.service
+ConditionPathExists=/opt/unified-inbox/compose.yaml
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/unified-inbox
+UMask=0077
+TimeoutStartSec=10min
+TimeoutStopSec=2min
+ExecStartPre=/usr/bin/test -s /opt/unified-inbox/secrets/telegram_bot_token
+ExecStartPre=/usr/bin/test -s /opt/unified-inbox/secrets/telegram_outbox_bot_token
+ExecStartPre=/usr/bin/test -s /opt/unified-inbox/secrets/discord_user_token
+ExecStartPre=/usr/bin/test -s /opt/unified-inbox/secrets/internal_api_token
+ExecStartPre=/usr/bin/docker compose config --quiet
+ExecStart=/usr/bin/docker compose up -d --remove-orphans
+ExecReload=/usr/bin/docker compose up -d --build --remove-orphans
+ExecStop=/usr/bin/docker compose down
+
+[Install]
+WantedBy=multi-user.target

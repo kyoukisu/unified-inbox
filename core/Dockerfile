@@ -1,6 +1,8 @@
 FROM ghcr.io/astral-sh/uv:0.9.30 AS uv
 FROM python:3.13-slim
 
+ARG APP_UID=1000
+
 COPY --from=uv /uv /usr/local/bin/uv
 
 ENV PATH="/app/.venv/bin:$PATH" \
@@ -17,7 +19,7 @@ COPY core ./core
 COPY discord-adapter/pyproject.toml ./discord-adapter/pyproject.toml
 RUN uv sync --frozen --no-dev --package unified-inbox-core \
     && mkdir -p /data \
-    && chown 1000:1000 /data
+    && chown "${APP_UID}:0" /data
 
-USER 1000:1000
+USER ${APP_UID}:0
 CMD ["unified-inbox-core"]

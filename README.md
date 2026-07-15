@@ -40,6 +40,19 @@ just logs
 
 Do not commit anything under `secrets/` or the local `.env`.
 
+## Deployment boundary
+
+NixOS declaratively enables Docker, installs `unified-inbox.service`, defines startup ordering, validates every required secret, and owns the Compose lifecycle. The private source checkout intentionally remains at `/home/user/unified-inbox`; SQLite, Steam refresh state, `.env`, and `0600` secrets remain outside both Git and the Nix store.
+
+Update the private checkout with a fast-forward pull, then use the declarative unit's reload path to rebuild and reconcile containers:
+
+```bash
+git -C /home/user/unified-inbox pull --ff-only
+sudo systemctl reload unified-inbox.service
+```
+
+Do not fetch the private repository or inject runtime credentials from a Nix derivation: Nix store paths are world-readable.
+
 ## Account risk
 
 The Discord adapter automates a normal user account. Discord explicitly prohibits self-bots and may terminate that account. The adapter is isolated so its failure does not compromise Telegram routing or Steam state.

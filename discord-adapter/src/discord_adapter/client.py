@@ -16,6 +16,15 @@ class CoreDeliveryError(RuntimeError):
     """Raised when an inbound Discord event cannot reach the core."""
 
 
+def discord_nonce_for_idempotency_key(idempotency_key: str) -> int:
+    unsigned = int.from_bytes(
+        hashlib.sha256(idempotency_key.encode()).digest()[:8],
+        byteorder="big",
+        signed=False,
+    )
+    return unsigned & ((1 << 63) - 1)
+
+
 class DiscordBridgeClient(discord.Client):
     def __init__(
         self,
@@ -133,11 +142,7 @@ class DiscordBridgeClient(discord.Client):
                 filename=image_filename or "image",
             )
 
-        nonce = int.from_bytes(
-            hashlib.sha256(idempotency_key.encode()).digest()[:8],
-            byteorder="big",
-            signed=False,
-        )
+        nonce = discord_nonce_for_idempotency_key(idempotency_key)
         self._remember_bridge_value(self._bridge_nonces, nonce)
         if file is not None and reference is not None:
             sent = await channel.send(

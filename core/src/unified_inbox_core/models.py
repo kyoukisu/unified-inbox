@@ -6,6 +6,7 @@ from typing import Literal, cast
 
 Platform = Literal["discord", "steam"]
 Direction = Literal["inbound", "outbound_native"]
+PresenceStatus = Literal["online", "idle", "busy", "offline"]
 JobSource = Literal["discord", "steam", "telegram"]
 IngressKind = Literal["external_event", "telegram_update"]
 JobKind = Literal["route_external_event", "route_telegram_update"]
@@ -121,6 +122,53 @@ class InboundEvent:
             "attachments": [attachment.to_mapping() for attachment in self.attachments],
             "direction": self.direction,
         }
+
+
+@dataclass(frozen=True, slots=True)
+class PresenceEvent:
+    platform: Platform
+    event_id: str
+    conversation_id: str
+    display_name: str
+    status: PresenceStatus
+
+    @classmethod
+    def from_mapping(cls, data: Mapping[str, object]) -> PresenceEvent:
+        platform_value = _required_string(data, "platform")
+        if platform_value not in ("discord", "steam"):
+            raise ValueError("platform must be discord or steam")
+        status_value = _required_string(data, "status")
+        if status_value not in ("online", "idle", "busy", "offline"):
+            raise ValueError("status must be online, idle, busy, or offline")
+        return cls(
+            platform=platform_value,
+            event_id=_required_string(data, "event_id"),
+            conversation_id=_required_string(data, "conversation_id"),
+            display_name=_required_string(data, "display_name"),
+            status=status_value,
+        )
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "kind": "presence",
+            "platform": self.platform,
+            "event_id": self.event_id,
+            "conversation_id": self.conversation_id,
+            "display_name": self.display_name,
+            "status": self.status,
+        }
+
+
+ExternalEvent = InboundEvent | PresenceEvent
+
+
+def external_event_from_mapping(data: Mapping[str, object]) -> ExternalEvent:
+    kind = data.get("kind", "message")
+    if kind == "message":
+        return InboundEvent.from_mapping(data)
+    if kind == "presence":
+        return PresenceEvent.from_mapping(data)
+    raise ValueError("kind must be message or presence")
 
 
 @dataclass(frozen=True, slots=True)

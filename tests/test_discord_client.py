@@ -6,7 +6,17 @@ from discord_adapter.client import (
     discord_nonce_for_idempotency_key,
     discord_nonce_value,
     discord_text_without_embedded_image,
+    normalize_discord_presence,
 )
+
+
+def test_discord_presence_statuses_are_normalized() -> None:
+    assert normalize_discord_presence(discord.Status.online) == "online"
+    assert normalize_discord_presence(discord.Status.idle) == "idle"
+    assert normalize_discord_presence(discord.Status.dnd) == "busy"
+    assert normalize_discord_presence(discord.Status.offline) == "offline"
+    assert normalize_discord_presence(discord.Status.invisible) == "offline"
+    assert normalize_discord_presence("unknown") is None
 
 
 def test_discord_nonce_fits_signed_int64_and_is_deterministic() -> None:

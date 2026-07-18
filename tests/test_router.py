@@ -9,7 +9,13 @@ import pytest
 from unified_inbox_core.adapter import AdapterClient, AdapterDelivery
 from unified_inbox_core.db import Database
 from unified_inbox_core.delivery import DeliveryWorker
-from unified_inbox_core.models import DeliveryJob, InboundEvent, OutboundMessage, Platform
+from unified_inbox_core.models import (
+    DeliveryJob,
+    InboundEvent,
+    OutboundMessage,
+    Platform,
+    PresenceEvent,
+)
 from unified_inbox_core.router import Router
 from unified_inbox_core.telegram import TelegramClient, TelegramError, TelegramImage
 
@@ -17,9 +23,11 @@ from unified_inbox_core.telegram import TelegramClient, TelegramError, TelegramI
 class FakeTelegram:
     def __init__(self) -> None:
         self.created_topics: list[str] = []
+        self.edited_topics: list[str] = []
         self.sent_text: list[tuple[int, str]] = []
         self.sent_photos: list[tuple[int, str | None]] = []
         self.sent_animations: list[tuple[int, str | None, str]] = []
+        self.deleted_messages: list[int] = []
         self.reactions: list[tuple[int, str]] = []
 
     async def create_topic(self, chat_id: int, name: str) -> int:
@@ -28,10 +36,15 @@ class FakeTelegram:
         return 77
 
     async def edit_topic(self, chat_id: int, topic_id: int, name: str) -> None:
-        return None
+        assert chat_id == -100123
+        self.edited_topics.append(name)
 
     async def close_topic(self, chat_id: int, topic_id: int) -> None:
         return None
+
+    async def delete_message(self, chat_id: int, message_id: int) -> None:
+        assert chat_id == -100123
+        self.deleted_messages.append(message_id)
 
     async def send_text(
         self,
@@ -138,6 +151,19 @@ async def process_next(db: Database, router: Router) -> DeliveryJob:
     return job
 
 
+def presence_event(**overrides: object) -> PresenceEvent:
+    payload: dict[str, object] = {
+        "kind": "presence",
+        "platform": "steam",
+        "event_id": "presence-1",
+        "conversation_id": "steam-alice",
+        "display_name": "Alice",
+        "status": "online",
+    }
+    payload.update(overrides)
+    return PresenceEvent.from_mapping(payload)
+
+
 def inbound_event(**overrides: object) -> InboundEvent:
     payload: dict[str, object] = {
         "platform": "steam",
@@ -152,6 +178,41 @@ def inbound_event(**overrides: object) -> InboundEvent:
     }
     payload.update(overrides)
     return InboundEvent.from_mapping(payload)
+
+
+@pytest.mark.asyncio
+async def test_presence_is_persisted_and_updates_topic_without_messages(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bridge.sqlite3")
+    telegram = FakeTelegram()
+    adapters = FakeAdapters()
+    async with aiohttp.ClientSession() as session:
+        router = Router(
+            db,
+            cast(TelegramClient, telegram),
+            cast(AdapterClient, adapters),
+            session,
+            -100123,
+            999,
+            1024,
+        )
+        router.enqueue_inbound(presence_event())
+        await process_next(db, router)
+        assert db.get_presence("steam", "steam-alice") == "online"
+        assert telegram.created_topics == []
+        assert telegram.sent_text == []
+
+        router.enqueue_inbound(inbound_event(event_id="message-after-presence"))
+        await process_next(db, router)
+        assert telegram.created_topics == ["🟢 🎮 Steam · Alice"]
+
+        router.enqueue_inbound(presence_event(event_id="presence-idle", status="idle"))
+        await process_next(db, router)
+        router.enqueue_inbound(presence_event(event_id="presence-idle-repeat", status="idle"))
+        await process_next(db, router)
+
+    assert telegram.edited_topics == ["🟡 🎮 Steam · Alice"]
+    assert db.get_presence("steam", "steam-alice") == "idle"
+    db.close()
 
 
 @pytest.mark.asyncio
@@ -256,6 +317,40 @@ async def test_native_outbound_creates_persisted_native_conversation(tmp_path: P
     assert db.get_conversation("steam", "unknown-chat") is not None
     assert inbox.created_topics == ["🎮 Steam · Unknown"]
     assert outbox.sent_text == [(77, "started from native client")]
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_bot_topic_edit_service_message_is_deleted(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bridge.sqlite3")
+    telegram = FakeTelegram()
+    adapters = FakeAdapters()
+    async with aiohttp.ClientSession() as session:
+        router = Router(
+            db,
+            cast(TelegramClient, telegram),
+            cast(AdapterClient, adapters),
+            session,
+            -100123,
+            999,
+            1024,
+        )
+        router.enqueue_telegram_update(
+            {
+                "update_id": 399,
+                "message": {
+                    "message_id": 87,
+                    "message_thread_id": 77,
+                    "chat": {"id": -100123},
+                    "from": {"id": 8050425195, "is_bot": True},
+                    "forum_topic_edited": {"name": "🟢 👾 Discord · Bob"},
+                },
+            }
+        )
+        await process_next(db, router)
+
+    assert telegram.deleted_messages == [87]
+    assert adapters.sent == []
     db.close()
 
 

@@ -6,7 +6,9 @@ import io
 import logging
 import mimetypes
 from collections.abc import Sequence
+from typing import Literal
 from urllib.parse import parse_qs, urlsplit
+from uuid import uuid4
 
 import aiohttp
 import discord
@@ -18,6 +20,23 @@ _LOGGER = logging.getLogger(__name__)
 
 class CoreDeliveryError(RuntimeError):
     """Raised when an inbound Discord event cannot reach the core."""
+
+
+DiscordPresence = Literal["online", "idle", "busy", "offline"]
+
+
+def normalize_discord_presence(value: object) -> DiscordPresence | None:
+    raw_value = getattr(value, "value", value)
+    if not isinstance(raw_value, str):
+        return None
+    normalized = raw_value.lower()
+    if normalized in ("online", "idle", "offline"):
+        return normalized
+    if normalized in ("dnd", "do_not_disturb"):
+        return "busy"
+    if normalized == "invisible":
+        return "offline"
+    return None
 
 
 def discord_nonce_for_idempotency_key(idempotency_key: str) -> int:
@@ -192,6 +211,10 @@ class DiscordBridgeClient(discord.Client):
         self._outbound_locks: dict[str, asyncio.Lock] = {}
         self._spool_wake = asyncio.Event()
         self._spool_task: asyncio.Task[None] | None = None
+        self._dm_channels_by_user: dict[int, int] = {}
+        self._last_presence: dict[int, tuple[DiscordPresence, str]] = {}
+        self._presence_session_id = uuid4().hex
+        self._presence_sequence = 0
 
     @property
     def spool_task(self) -> asyncio.Task[None] | None:
@@ -217,13 +240,88 @@ class DiscordBridgeClient(discord.Client):
             raise RuntimeError("Discord ready event has no current user")
         _LOGGER.info("Discord user session connected as %s (%s)", self.user, self.user.id)
         self.start_spool()
+        for channel in self.private_channels:
+            self._remember_dm_channel(channel)
+        for relationship in self.relationships:
+            await self._enqueue_presence(
+                relationship.id,
+                relationship.user.display_name,
+                relationship.status,
+            )
+        for user_id in self._dm_channels_by_user:
+            if user_id in self._last_presence:
+                continue
+            for guild in self.guilds:
+                member = guild.get_member(user_id)
+                if member is not None:
+                    await self._enqueue_presence(member.id, member.display_name, member.status)
+                    break
+
+    async def on_presence_update(
+        self,
+        before: discord.Relationship | discord.Member,
+        after: discord.Relationship | discord.Member,
+    ) -> None:
+        del before
+        display_name = (
+            after.user.display_name
+            if isinstance(after, discord.Relationship)
+            else after.display_name
+        )
+        await self._enqueue_presence(after.id, display_name, after.status)
 
     async def on_message(self, message: discord.Message) -> None:
         if self.user is None or message.guild is not None:
             return
+        self._remember_dm_channel(message.channel)
         async with self._event_lock:
             direction = "outbound_native" if message.author.id == self.user.id else "inbound"
             await self._enqueue_message(message, direction)
+
+    def _remember_dm_channel(self, channel: object) -> None:
+        if isinstance(channel, discord.DMChannel):
+            self._dm_channels_by_user[channel.recipient.id] = channel.id
+
+    async def _enqueue_presence(
+        self,
+        user_id: int,
+        display_name: str,
+        raw_status: object,
+    ) -> None:
+        channel_id = self._dm_channels_by_user.get(user_id)
+        status = normalize_discord_presence(raw_status)
+        if channel_id is None or status is None:
+            return
+        channel = self.get_channel(channel_id)
+        if isinstance(channel, discord.DMChannel):
+            display_name = channel.recipient.display_name
+        current = (status, display_name)
+        if self._last_presence.get(user_id) == current:
+            return
+        self._presence_sequence += 1
+        payload: dict[str, object] = {
+            "kind": "presence",
+            "platform": "discord",
+            "event_id": (
+                f"presence:{channel_id}:{self._presence_session_id}:{self._presence_sequence}"
+            ),
+            "conversation_id": str(channel_id),
+            "display_name": display_name,
+            "status": status,
+        }
+        try:
+            created = self._store.enqueue_event(payload)
+        except Exception:
+            _LOGGER.critical(
+                "Unable to persist Discord presence for user %s; stopping adapter",
+                user_id,
+                exc_info=True,
+            )
+            await self.close()
+            raise
+        self._last_presence[user_id] = current
+        if created:
+            self._spool_wake.set()
 
     async def _enqueue_message(self, message: discord.Message, direction: str) -> None:
         if direction == "outbound_native":

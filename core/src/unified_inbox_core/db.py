@@ -15,6 +15,7 @@ from unified_inbox_core.models import (
     JobState,
     LegacyFailure,
     Platform,
+    PresenceStatus,
 )
 
 _SCHEMA = """
@@ -32,6 +33,14 @@ CREATE TABLE IF NOT EXISTS conversations (
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE (platform, external_chat_id)
+);
+
+CREATE TABLE IF NOT EXISTS presence_states (
+    platform TEXT NOT NULL CHECK (platform IN ('discord', 'steam')),
+    external_chat_id TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('online', 'idle', 'busy', 'offline')),
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (platform, external_chat_id)
 );
 
 CREATE TABLE IF NOT EXISTS message_copies (
@@ -130,7 +139,11 @@ class Database:
                 "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (2, ?)",
                 (now,),
             )
-            self._connection.execute("PRAGMA user_version = 2")
+            self._connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (3, ?)",
+                (now,),
+            )
+            self._connection.execute("PRAGMA user_version = 3")
 
     def close(self) -> None:
         self._connection.close()
@@ -669,6 +682,44 @@ class Database:
                 WHERE id = ?
                 """,
                 (display_name, conversation_id),
+            )
+
+    def get_presence(
+        self,
+        platform: Platform,
+        external_chat_id: str,
+    ) -> PresenceStatus | None:
+        row = self._connection.execute(
+            """
+            SELECT status
+            FROM presence_states
+            WHERE platform = ? AND external_chat_id = ?
+            """,
+            (platform, external_chat_id),
+        ).fetchone()
+        if row is None:
+            return None
+        status = str(row["status"])
+        if status not in ("online", "idle", "busy", "offline"):
+            raise RuntimeError(f"database contains invalid presence status: {status}")
+        return status
+
+    def store_presence(
+        self,
+        platform: Platform,
+        external_chat_id: str,
+        status: PresenceStatus,
+    ) -> None:
+        with self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO presence_states (platform, external_chat_id, status, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT (platform, external_chat_id) DO UPDATE SET
+                    status = excluded.status,
+                    updated_at = excluded.updated_at
+                """,
+                (platform, external_chat_id, status, time.time()),
             )
 
     def store_message_copy(

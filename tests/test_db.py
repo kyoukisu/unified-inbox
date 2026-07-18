@@ -9,6 +9,7 @@ def test_database_persists_conversation_and_message_mapping(tmp_path: Path) -> N
     db = Database(path)
     conversation = db.create_conversation("steam", "76561198000000000", "Alice", 42)
     db.store_message_copy(conversation.id, "1700000000:0", 100, "inbound")
+    db.store_presence("steam", "76561198000000000", "online")
     db.close()
 
     reopened = Database(path)
@@ -17,6 +18,7 @@ def test_database_persists_conversation_and_message_mapping(tmp_path: Path) -> N
     assert reopened.get_conversation_by_topic(42) == conversation
     assert reopened.telegram_message_for_external(conversation.id, "1700000000:0") == 100
     assert reopened.external_message_for_telegram(conversation.id, 100) == "1700000000:0"
+    assert reopened.get_presence("steam", "76561198000000000") == "online"
     reopened.close()
 
 

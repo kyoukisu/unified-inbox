@@ -15,13 +15,18 @@ from unified_inbox_core.models import (
     Conversation,
     DeliveryJob,
     EnqueueResult,
+    ExternalEvent,
     InboundEvent,
     OutboundMessage,
+    PresenceEvent,
+    PresenceStatus,
+    external_event_from_mapping,
 )
 from unified_inbox_core.telegram import TelegramClient, split_utf16, utf16_length
 
 _LOGGER = logging.getLogger(__name__)
 _PLATFORM_ICON = {"discord": "👾 Discord", "steam": "🎮 Steam"}
+_PRESENCE_ICON = {"online": "🟢", "idle": "🟡", "busy": "🔴", "offline": "⚫"}
 
 
 class Router:
@@ -46,7 +51,7 @@ class Router:
         self._max_image_bytes = max_image_bytes
         self._conversation_lock = asyncio.Lock()
 
-    def enqueue_inbound(self, event: InboundEvent) -> EnqueueResult:
+    def enqueue_inbound(self, event: ExternalEvent) -> EnqueueResult:
         return self._db.enqueue_external_event(
             event.platform,
             event.event_id,
@@ -99,10 +104,13 @@ class Router:
         payload = cast(dict[str, object], raw)
         if job.kind == "route_external_event":
             try:
-                event = InboundEvent.from_mapping(payload)
+                event = external_event_from_mapping(payload)
             except ValueError as exc:
                 raise PermanentDeliveryError(str(exc)) from exc
-            await self._process_inbound(job, event)
+            if isinstance(event, PresenceEvent):
+                await self._process_presence(job, event)
+            else:
+                await self._process_inbound(job, event)
             return
         if job.kind == "route_telegram_update":
             await self._process_telegram_update(job, payload)
@@ -230,6 +238,33 @@ class Router:
             "outbound" if event.direction == "outbound_native" else "inbound",
         )
 
+    async def _process_presence(self, job: DeliveryJob, event: PresenceEvent) -> None:
+        current_status = self._db.get_presence(event.platform, event.conversation_id)
+        conversation = self._db.get_conversation(event.platform, event.conversation_id)
+        if conversation is None:
+            self._db.store_presence(event.platform, event.conversation_id, event.status)
+            return
+
+        display_name_changed = conversation.display_name != event.display_name
+        if current_status == event.status and not display_name_changed:
+            return
+
+        part_key = "topic"
+        if self._db.get_delivery_part(job.id, part_key) is None:
+            await self._telegram.edit_topic(
+                self._chat_id,
+                conversation.telegram_topic_id,
+                self._topic_name(event.platform, event.display_name, event.status),
+            )
+            self._db.store_delivery_part(
+                job.id,
+                part_key,
+                str(conversation.telegram_topic_id),
+            )
+        self._db.store_presence(event.platform, event.conversation_id, event.status)
+        if display_name_changed:
+            self._db.update_display_name(conversation.id, event.display_name)
+
     async def _process_telegram_update(
         self,
         job: DeliveryJob,
@@ -239,6 +274,22 @@ class Router:
         if not isinstance(raw_message, dict):
             return
         message = cast(dict[str, object], raw_message)
+        chat = message.get("chat")
+        sender = message.get("from")
+        typed_chat = cast(dict[str, object], chat) if isinstance(chat, dict) else {}
+        typed_sender = cast(dict[str, object], sender) if isinstance(sender, dict) else {}
+        message_id = message.get("message_id")
+        if (
+            typed_chat.get("id") == self._chat_id
+            and typed_sender.get("is_bot") is True
+            and "forum_topic_edited" in message
+            and isinstance(message_id, int)
+        ):
+            part_key = "delete-topic-edit"
+            if self._db.get_delivery_part(job.id, part_key) is None:
+                await self._telegram.delete_message(self._chat_id, message_id)
+                self._db.store_delivery_part(job.id, part_key, str(message_id))
+            return
         if not self._is_authorized_message(message):
             _LOGGER.warning("Rejected unauthorized Telegram update %s", job.event_id)
             return
@@ -356,7 +407,11 @@ class Router:
         conversation = self._db.get_conversation(event.platform, event.conversation_id)
         if conversation is not None:
             if conversation.display_name != event.display_name:
-                topic_name = self._topic_name(event.platform, event.display_name)
+                topic_name = self._topic_name(
+                    event.platform,
+                    event.display_name,
+                    self._db.get_presence(event.platform, event.conversation_id),
+                )
                 await self._telegram.edit_topic(
                     self._chat_id,
                     conversation.telegram_topic_id,
@@ -378,7 +433,11 @@ class Router:
                 return conversation
             topic_id = await self._telegram.create_topic(
                 self._chat_id,
-                self._topic_name(event.platform, event.display_name),
+                self._topic_name(
+                    event.platform,
+                    event.display_name,
+                    self._db.get_presence(event.platform, event.conversation_id),
+                ),
             )
             return self._db.create_conversation(
                 event.platform,
@@ -531,8 +590,13 @@ class Router:
         return f"{platform}:{external_chat_id}"
 
     @staticmethod
-    def _topic_name(platform: str, display_name: str) -> str:
-        name = f"{_PLATFORM_ICON[platform]} · {display_name}"
+    def _topic_name(
+        platform: str,
+        display_name: str,
+        status: PresenceStatus | None = None,
+    ) -> str:
+        presence = f"{_PRESENCE_ICON[status]} " if status is not None else ""
+        name = f"{presence}{_PLATFORM_ICON[platform]} · {display_name}"
         if utf16_length(name) <= 128:
             return name
         return f"{split_utf16(name, 127)[0]}…"

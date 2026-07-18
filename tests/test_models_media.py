@@ -1,12 +1,42 @@
 import pytest
 
 from unified_inbox_core.media import is_allowed_media_url
-from unified_inbox_core.models import InboundEvent
+from unified_inbox_core.models import PresenceEvent, external_event_from_mapping
+
+
+def test_presence_event_is_parsed_without_message_content() -> None:
+    event = external_event_from_mapping(
+        {
+            "kind": "presence",
+            "platform": "discord",
+            "event_id": "presence-1",
+            "conversation_id": "dm-1",
+            "display_name": "Alice",
+            "status": "busy",
+        }
+    )
+
+    assert event == PresenceEvent("discord", "presence-1", "dm-1", "Alice", "busy")
+
+
+@pytest.mark.parametrize("status", ["invisible", "unknown", ""])
+def test_presence_event_rejects_unknown_status(status: str) -> None:
+    with pytest.raises(ValueError, match="status"):
+        PresenceEvent.from_mapping(
+            {
+                "kind": "presence",
+                "platform": "steam",
+                "event_id": "presence-2",
+                "conversation_id": "steam-1",
+                "display_name": "Bob",
+                "status": status,
+            }
+        )
 
 
 def test_inbound_event_requires_content() -> None:
     with pytest.raises(ValueError, match="text or at least one attachment"):
-        InboundEvent.from_mapping(
+        external_event_from_mapping(
             {
                 "platform": "steam",
                 "event_id": "event-1",
@@ -23,7 +53,7 @@ def test_inbound_event_requires_content() -> None:
 
 def test_inbound_event_rejects_unknown_direction() -> None:
     with pytest.raises(ValueError, match="direction must be"):
-        InboundEvent.from_mapping(
+        external_event_from_mapping(
             {
                 "platform": "discord",
                 "event_id": "event-2",

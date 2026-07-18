@@ -116,6 +116,12 @@ class TelegramClient:
             {"chat_id": chat_id, "message_thread_id": topic_id},
         )
 
+    async def delete_message(self, chat_id: int, message_id: int) -> None:
+        await self.call(
+            "deleteMessage",
+            {"chat_id": chat_id, "message_id": message_id},
+        )
+
     async def send_text(
         self,
         chat_id: int,

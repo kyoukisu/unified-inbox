@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 
 import SteamUser from "steam-user";
@@ -6,6 +7,7 @@ import { loadConfig } from "./config.mjs";
 import { DeliveryStore } from "./deliveries.mjs";
 import { atomicWritePrivate, readRequiredFile } from "./files.mjs";
 import { messageIdentity, parseFriendMessage } from "./message.mjs";
+import { normalizeSteamPresence } from "./presence.mjs";
 import { PendingEventSpool } from "./spool.mjs";
 import { SteamImageUploader } from "./steam-image.mjs";
 
@@ -26,6 +28,9 @@ let spoolClosed = false;
 const bridgeMessageIds = new Set();
 const bridgeImageUrls = new Set();
 const outboundLocks = new Map();
+const lastPresence = new Map();
+const presenceSessionId = randomUUID();
+let presenceSequence = 0;
 
 function rememberBridgeValue(values, value) {
   if (values.size >= 2048) values.delete(values.values().next().value);
@@ -83,6 +88,14 @@ client.on("refreshToken", async (token) => {
     log("ERROR", "Unable to persist rotated Steam refresh token", error);
   }
 });
+client.on("user", (steamId, user) => {
+  handleSteamPresence(steamId, user);
+});
+client.on("friendPersonasLoaded", () => {
+  for (const [steamId, user] of Object.entries(client.users)) {
+    handleSteamPresence(steamId, user);
+  }
+});
 
 client.chat.on("friendMessage", (message) => {
   handleFriendMessage(message, "inbound");
@@ -91,8 +104,38 @@ client.chat.on("friendMessageEcho", (message) => {
   setTimeout(() => handleFriendMessage(message, "outbound_native"), 2000);
 });
 
+function handleSteamPresence(steamIdValue, user) {
+  const steamId = steamIdValue.toString();
+  if (steamId === accountId) return;
+  const status = normalizeSteamPresence(user?.persona_state);
+  if (!status) return;
+  const displayName = user?.player_name ?? client.users[steamId]?.player_name;
+  if (!displayName) return;
+  const current = `${status}\0${displayName}`;
+  if (lastPresence.get(steamId) === current) return;
+
+  presenceSequence += 1;
+  const eventId = `presence:${steamId}:${presenceSessionId}:${presenceSequence}`;
+  try {
+    spool.enqueue({
+      kind: "presence",
+      platform: "steam",
+      event_id: eventId,
+      conversation_id: steamId,
+      display_name: displayName,
+      status,
+    });
+    lastPresence.set(steamId, current);
+  } catch (error) {
+    log("ERROR", `Unable to persist Steam presence ${eventId}`, error);
+    stopForSpoolFailure(error);
+  }
+}
+
 function handleFriendMessage(message, direction) {
   const steamId = message.steamid_friend.toString();
+  const user = client.users[steamId];
+  if (user) handleSteamPresence(steamId, user);
   const identity = messageIdentity(message);
   const { text, attachments } = parseFriendMessage(message);
   if (!text && attachments.length === 0) return;

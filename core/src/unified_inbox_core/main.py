@@ -13,7 +13,7 @@ from unified_inbox_core.adapter import AdapterClient
 from unified_inbox_core.config import Settings
 from unified_inbox_core.db import Database
 from unified_inbox_core.delivery import DeliveryWorker
-from unified_inbox_core.models import InboundEvent
+from unified_inbox_core.models import external_event_from_mapping
 from unified_inbox_core.router import Router
 from unified_inbox_core.telegram import TelegramClient
 
@@ -150,7 +150,7 @@ class CoreApplication:
                 status=400,
             )
         try:
-            event = InboundEvent.from_mapping(cast(dict[str, object], raw_object))
+            event = external_event_from_mapping(cast(dict[str, object], raw_object))
             result = self._router.enqueue_inbound(event)
         except ValueError as exc:
             return web.json_response({"ok": False, "error": str(exc)}, status=400)

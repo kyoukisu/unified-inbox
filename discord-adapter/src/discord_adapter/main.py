@@ -4,7 +4,6 @@ import asyncio
 import hmac
 import json
 import logging
-from contextlib import suppress
 from typing import cast
 
 import aiohttp
@@ -13,6 +12,7 @@ from aiohttp.web_request import FileField
 
 from discord_adapter.client import DiscordBridgeClient
 from discord_adapter.config import Settings
+from discord_adapter.store import AdapterStore
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -21,26 +21,41 @@ class DiscordAdapterApplication:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
         self._session = aiohttp.ClientSession()
+        self._store = AdapterStore(settings.database_path)
         self._client = DiscordBridgeClient(
             self._session,
             settings.core_url,
             settings.internal_token,
+            self._store,
         )
         self._discord_task: asyncio.Task[None] | None = None
 
     async def start(self) -> None:
+        self._client.start_spool()
         self._discord_task = asyncio.create_task(
             self._client.start(self._settings.discord_token),
             name="discord-client",
         )
 
+    async def wait(self) -> None:
+        spool_task = self._client.spool_task
+        if self._discord_task is None or spool_task is None:
+            raise RuntimeError("Discord adapter background tasks are not started")
+        done, _ = await asyncio.wait(
+            (self._discord_task, spool_task),
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in done:
+            task.result()
+        raise RuntimeError("A Discord adapter background task stopped unexpectedly")
+
     async def close(self) -> None:
         await self._client.close()
         if self._discord_task is not None:
             self._discord_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await self._discord_task
+            await asyncio.gather(self._discord_task, return_exceptions=True)
         await self._session.close()
+        self._store.close()
 
     def web_application(self) -> web.Application:
         app = web.Application(client_max_size=self._settings.max_image_bytes + 1024 * 1024)
@@ -49,18 +64,29 @@ class DiscordAdapterApplication:
         return app
 
     async def health(self, request: web.Request) -> web.Response:
+        del request
         user = self._client.user
+        connected = user is not None and self._client.is_ready() and not self._client.is_closed()
+        store_ok = self._store.health_probe()
+        ok = connected and store_ok and self._client.spool_alive
         return web.json_response(
             {
-                "ok": user is not None and not self._client.is_closed(),
-                "connected": user is not None and not self._client.is_closed(),
+                "ok": ok,
+                "connected": connected,
+                "spool_alive": self._client.spool_alive,
+                "pending_events": self._client.pending_count,
+                "store_ok": store_ok,
                 "user_id": str(user.id) if user is not None else None,
-            }
+            },
+            status=200 if ok else 503,
         )
 
     async def send_message(self, request: web.Request) -> web.Response:
         if not self._authorized(request):
-            raise web.HTTPUnauthorized(text="invalid internal token")
+            return web.json_response(
+                {"ok": False, "error": "invalid internal token"},
+                status=401,
+            )
         try:
             metadata, image, image_filename = await self._parse_request(request)
             message_id = await self._client.send_message(
@@ -72,10 +98,10 @@ class DiscordAdapterApplication:
                 image_filename=image_filename,
             )
         except (ValueError, json.JSONDecodeError) as exc:
-            raise web.HTTPBadRequest(text=str(exc)) from exc
-        except Exception:
+            return web.json_response({"ok": False, "error": str(exc)}, status=400)
+        except Exception as exc:
             _LOGGER.exception("Discord outbound delivery failed")
-            raise web.HTTPBadGateway(text="Discord outbound delivery failed") from None
+            return web.json_response({"ok": False, "error": str(exc)}, status=502)
         return web.json_response({"ok": True, "message_id": message_id})
 
     async def _parse_request(
@@ -148,7 +174,7 @@ async def _run() -> None:
         site = web.TCPSite(runner, settings.bind, settings.port)
         await site.start()
         _LOGGER.info("Discord adapter listening on %s:%s", settings.bind, settings.port)
-        await asyncio.Event().wait()
+        await adapter.wait()
     finally:
         await runner.cleanup()
         await adapter.close()

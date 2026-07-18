@@ -2,6 +2,7 @@ name: unified-inbox
 
 x-common: &common
   restart: unless-stopped
+  stop_grace_period: 100s
   init: true
   network_mode: host
   read_only: true
@@ -32,6 +33,9 @@ services:
       TELEGRAM_POLL_TIMEOUT: ${TELEGRAM_POLL_TIMEOUT:-30}
       CORE_LOG_LEVEL: ${CORE_LOG_LEVEL:-INFO}
       MAX_IMAGE_BYTES: ${MAX_IMAGE_BYTES:-20971520}
+      DELIVERY_MAX_ATTEMPTS: ${DELIVERY_MAX_ATTEMPTS:-10}
+      DELIVERY_LEASE_SECONDS: ${DELIVERY_LEASE_SECONDS:-300}
+      DELIVERY_RETRY_MAX_SECONDS: ${DELIVERY_RETRY_MAX_SECONDS:-300}
       DISCORD_ADAPTER_URL: http://127.0.0.1:8081
       STEAM_ADAPTER_URL: http://127.0.0.1:8082
     secrets:
@@ -62,10 +66,13 @@ services:
       CORE_URL: http://127.0.0.1:8080
       CORE_INTERNAL_TOKEN_FILE: /run/secrets/internal_api_token
       DISCORD_USER_TOKEN_FILE: /run/secrets/discord_user_token
+      ADAPTER_DATABASE: /data/discord-adapter.sqlite3
       MAX_IMAGE_BYTES: ${MAX_IMAGE_BYTES:-20971520}
     secrets:
       - discord_user_token
       - internal_api_token
+    volumes:
+      - discord-data:/data
     depends_on:
       core:
         condition: service_healthy
@@ -91,6 +98,7 @@ services:
       CORE_URL: http://127.0.0.1:8080
       CORE_INTERNAL_TOKEN_FILE: /run/secrets/internal_api_token
       STEAM_REFRESH_TOKEN_FILE: /data/refresh-token
+      ADAPTER_DATABASE: /data/steam-adapter.sqlite3
       MAX_IMAGE_BYTES: ${MAX_IMAGE_BYTES:-20971520}
     secrets:
       - internal_api_token
@@ -141,6 +149,7 @@ services:
 
 volumes:
   core-data:
+  discord-data:
   steam-data:
 
 secrets:

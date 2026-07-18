@@ -7,7 +7,7 @@
 [![CI](https://github.com/kyoukisu/unified-inbox/actions/workflows/ci.yml/badge.svg)](https://github.com/kyoukisu/unified-inbox/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-22c55e.svg)](LICENSE)
 [![Python 3.13](https://img.shields.io/badge/Python-3.13-3776ab.svg)](https://www.python.org/)
-[![Node.js 22](https://img.shields.io/badge/Node.js-22-5fa04e.svg)](https://nodejs.org/)
+[![Node.js 24](https://img.shields.io/badge/Node.js-24-5fa04e.svg)](https://nodejs.org/)
 [![Docker Compose](https://img.shields.io/badge/Docker-Compose-2496ed.svg)](https://docs.docker.com/compose/)
 
 </div>
@@ -32,11 +32,13 @@ Telegram cannot start a new external DM. A topic is created only after real nati
 - Reply mapping when the referenced external message is known.
 - Native outgoing-message mirroring from Discord and Steam desktop clients.
 - Separate Inbox and Outbox Telegram identities for visual direction.
-- SQLite-backed conversation, message-copy, deduplication, and polling state.
+- SQLite-backed durable delivery queue with crash leases, ordered retries, message-copy mappings, deduplication, and polling state.
 - Numeric Telegram chat and user ACLs.
 - Bounded HTTPS media downloads with platform-specific hostname allowlists.
 - Persistent Steam refresh-token rotation.
-- Idempotent adapter delivery and restart-safe Docker named volumes.
+- Persistent Discord and Steam ingress spools plus outbound checkpoints that reduce duplicate retries across restarts.
+- Telegram delivery reactions: `👀` queued, `👍` delivered, and `👎` terminal failure.
+- Retry-aware handling for Telegram flood control and missing reply targets.
 - Hardened containers: non-root UID, read-only root filesystems, dropped capabilities, and `no-new-privileges`.
 - NixOS module and Ubuntu systemd unit.
 
@@ -98,6 +100,9 @@ TELEGRAM_CHAT_ID=-1000000000000
 TELEGRAM_ALLOWED_USER_ID=123456789
 TELEGRAM_POLL_TIMEOUT=30
 MAX_IMAGE_BYTES=20971520
+DELIVERY_MAX_ATTEMPTS=10
+DELIVERY_LEASE_SECONDS=300
+DELIVERY_RETRY_MAX_SECONDS=300
 STEAM_AUTH_MODE=qr
 ```
 
@@ -259,7 +264,11 @@ Do **not** run `docker compose down -v` unless you intend to delete conversation
 
 Run commands inside a mapped conversation topic:
 
-- `/status` — adapter connection status.
+- `/status` — adapter connection and delivery-queue status.
+- `/failures` — list terminal delivery failures for this topic.
+- `/retry` — retry the oldest failed job in this topic.
+- `/retry <job-id>` — retry one failed job.
+- `/retry all` — retry all failed jobs in topic order.
 - `/rename <name>` — rename the Telegram topic.
 - `/close` — close the topic without deleting its persisted mapping.
 
@@ -269,8 +278,9 @@ Persistent state lives in two named volumes:
 
 | Volume | Contents |
 | --- | --- |
-| `unified-inbox_core-data` | SQLite conversations, message copies, deduplication, and Telegram offset |
-| `unified-inbox_steam-data` | Steam refresh token and delivery idempotency state |
+| `unified-inbox_core-data` | SQLite conversations, durable delivery jobs, message copies, deduplication, and Telegram offset |
+| `unified-inbox_discord-data` | Discord ingress spool and outbound idempotency state |
+| `unified-inbox_steam-data` | Steam refresh token, ingress spool, and outbound delivery checkpoints |
 
 `docker compose down`, system shutdown, service restart, and host reboot preserve both volumes. Back them up before destructive Docker maintenance. Never publish a backup: it contains private routing metadata and authentication material.
 
@@ -291,7 +301,7 @@ See [SECURITY.md](SECURITY.md) for reporting guidance and credential-rotation pr
 
 ## Development
 
-Install [uv](https://docs.astral.sh/uv/), Node.js 22, npm, and [just](https://github.com/casey/just):
+Install [uv](https://docs.astral.sh/uv/), Node.js 24, npm, and [just](https://github.com/casey/just):
 
 ```bash
 just lock
@@ -300,13 +310,15 @@ just unit
 just build
 ```
 
-The current test suite covers SQLite persistence, ACLs, routing, reply mappings, media validation, deduplication, native Outbox behavior, and Steam message parsing.
+The current test suite covers SQLite migrations and leases, crash recovery, per-conversation ordering, retry scheduling, delivery-part checkpoints, ACLs, routing, reply mappings, media validation, adapter spools, native Outbox behavior, and Steam message parsing.
 
 ## Limitations
 
 - Discord self-bots violate Discord's Terms of Service.
 - Only direct messages and Discord group DMs are routed; guild channels are ignored.
-- Native messages sent before the bridge observes a conversation are not replayed from history.
+- Native messages sent while an adapter process is not running are not yet replayed from platform history. Events observed by a running adapter are durably spooled.
+- Telegram retains unconsumed Bot API updates for at most 24 hours; a longer complete outage cannot be recovered through the Bot API.
+- Delivery is at-least-once. Persistent idempotency and part checkpoints prevent ordinary duplicates, but an ambiguous network failure after remote acceptance can still produce a visible duplicate rather than silent loss.
 - Telegram forum-supergroup members can read bridged content. Use a private group with intentionally limited membership.
 - The bridge does not provide end-to-end encryption beyond the underlying platforms.
 

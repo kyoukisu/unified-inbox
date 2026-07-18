@@ -6,10 +6,11 @@ from typing import cast
 
 import aiohttp
 
+from unified_inbox_core.errors import DeliveryError
 from unified_inbox_core.models import OutboundMessage, Platform
 
 
-class AdapterError(RuntimeError):
+class AdapterError(DeliveryError):
     """Raised when an external adapter rejects or fails a delivery."""
 
 
@@ -83,7 +84,7 @@ class AdapterClient:
                 timeout=aiohttp.ClientTimeout(total=5),
             ) as response:
                 return await self._response_payload(response)
-        except (aiohttp.ClientError, TimeoutError) as exc:
+        except (aiohttp.ClientError, TimeoutError, AdapterError) as exc:
             return {"ok": False, "error": str(exc)}
 
     @staticmethod
@@ -92,11 +93,19 @@ class AdapterClient:
             raw_object: object = await response.json()
         except (aiohttp.ContentTypeError, json.JSONDecodeError) as exc:
             message = f"adapter returned HTTP {response.status} with invalid JSON"
-            raise AdapterError(message) from exc
+            raise AdapterError(message, retryable=response.status >= 500) from exc
         if not isinstance(raw_object, dict):
             raise AdapterError("adapter response must be an object")
         payload = cast(dict[str, object], raw_object)
         if response.status >= 400:
             error = payload.get("error")
-            raise AdapterError(str(error or f"adapter returned HTTP {response.status}"))
+            retry_after_value = payload.get("retry_after")
+            retry_after = (
+                float(retry_after_value) if isinstance(retry_after_value, int | float) else None
+            )
+            raise AdapterError(
+                str(error or f"adapter returned HTTP {response.status}"),
+                retryable=response.status == 429 or response.status >= 500,
+                retry_after=retry_after,
+            )
         return payload

@@ -25,6 +25,7 @@ export async function loadConfig() {
     internalToken: await readSecret("CORE_INTERNAL_TOKEN_FILE"),
     refreshTokenFile: required("STEAM_REFRESH_TOKEN_FILE"),
     deliveriesFile: process.env.STEAM_DELIVERIES_FILE ?? "/data/deliveries.json",
+    spoolDatabase: process.env.ADAPTER_DATABASE ?? "/data/steam-adapter.sqlite3",
     maxImageBytes: Number.parseInt(process.env.MAX_IMAGE_BYTES ?? "20971520", 10),
     logLevel: process.env.ADAPTER_LOG_LEVEL ?? "INFO",
   };

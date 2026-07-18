@@ -45,6 +45,9 @@ class Settings:
     discord_adapter_url: str
     steam_adapter_url: str
     max_image_bytes: int
+    delivery_max_attempts: int
+    delivery_lease_seconds: int
+    delivery_retry_max_seconds: int
     log_level: str
 
     @classmethod
@@ -62,5 +65,8 @@ class Settings:
             discord_adapter_url=_required("DISCORD_ADAPTER_URL").rstrip("/"),
             steam_adapter_url=_required("STEAM_ADAPTER_URL").rstrip("/"),
             max_image_bytes=int(os.environ.get("MAX_IMAGE_BYTES", "20971520")),
+            delivery_max_attempts=int(os.environ.get("DELIVERY_MAX_ATTEMPTS", "10")),
+            delivery_lease_seconds=int(os.environ.get("DELIVERY_LEASE_SECONDS", "300")),
+            delivery_retry_max_seconds=int(os.environ.get("DELIVERY_RETRY_MAX_SECONDS", "300")),
             log_level=os.environ.get("CORE_LOG_LEVEL", "INFO").upper(),
         )

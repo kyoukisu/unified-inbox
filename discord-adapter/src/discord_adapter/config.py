@@ -30,6 +30,7 @@ class Settings:
     core_url: str
     internal_token: str
     discord_token: str
+    database_path: Path
     max_image_bytes: int
     log_level: str
 
@@ -41,6 +42,7 @@ class Settings:
             core_url=_required("CORE_URL").rstrip("/"),
             internal_token=_read_secret("CORE_INTERNAL_TOKEN_FILE"),
             discord_token=_read_secret("DISCORD_USER_TOKEN_FILE"),
+            database_path=Path(os.environ.get("ADAPTER_DATABASE", "/data/discord-adapter.sqlite3")),
             max_image_bytes=int(os.environ.get("MAX_IMAGE_BYTES", "20971520")),
             log_level=os.environ.get("ADAPTER_LOG_LEVEL", "INFO").upper(),
         )

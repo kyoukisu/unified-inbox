@@ -6,19 +6,26 @@ import { loadConfig } from "./config.mjs";
 import { DeliveryStore } from "./deliveries.mjs";
 import { atomicWritePrivate, readRequiredFile } from "./files.mjs";
 import { messageIdentity, parseFriendMessage } from "./message.mjs";
+import { PendingEventSpool } from "./spool.mjs";
 import { SteamImageUploader } from "./steam-image.mjs";
 
 const config = await loadConfig();
 const refreshToken = await readRequiredFile(config.refreshTokenFile, "Steam refresh token");
 const deliveries = new DeliveryStore(config.deliveriesFile);
 await deliveries.load();
+const spool = new PendingEventSpool(config.spoolDatabase);
 
 const client = new SteamUser({ autoRelogin: true, renewRefreshTokens: true });
 const imageUploader = new SteamImageUploader(client);
 let connected = false;
 let accountId = null;
+let shuttingDown = false;
+let spoolAlive = true;
+let spoolError = null;
+let spoolClosed = false;
 const bridgeMessageIds = new Set();
 const bridgeImageUrls = new Set();
+const outboundLocks = new Map();
 
 function rememberBridgeValue(values, value) {
   if (values.size >= 2048) values.delete(values.values().next().value);
@@ -35,6 +42,26 @@ function log(level, message, error = null) {
   const line = `${new Date().toISOString()} ${level} ${message}`;
   if (error) console.error(line, error instanceof Error ? error.message : String(error));
   else console.log(line);
+}
+
+function sleep(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function closeSpool() {
+  if (spoolClosed) return;
+  spoolClosed = true;
+  spool.close();
+}
+
+function stopForSpoolFailure(error) {
+  spoolAlive = false;
+  spoolError = error instanceof Error ? error.message : String(error);
+  shuttingDown = true;
+  process.exitCode = 1;
+  server.close();
+  client.logOff();
+  closeSpool();
 }
 
 client.on("loggedOn", () => {
@@ -58,13 +85,13 @@ client.on("refreshToken", async (token) => {
 });
 
 client.chat.on("friendMessage", (message) => {
-  void handleFriendMessage(message, "inbound");
+  handleFriendMessage(message, "inbound");
 });
 client.chat.on("friendMessageEcho", (message) => {
-  setTimeout(() => void handleFriendMessage(message, "outbound_native"), 2000);
+  setTimeout(() => handleFriendMessage(message, "outbound_native"), 2000);
 });
 
-async function handleFriendMessage(message, direction) {
+function handleFriendMessage(message, direction) {
   const steamId = message.steamid_friend.toString();
   const identity = messageIdentity(message);
   const { text, attachments } = parseFriendMessage(message);
@@ -77,34 +104,35 @@ async function handleFriendMessage(message, direction) {
     )
   ) return;
 
-  let persona = client.users[steamId];
-  if (!persona) {
-    try {
-      const result = await client.getPersonas([steamId]);
-      persona = result.personas?.[steamId];
-    } catch (error) {
-      log("WARN", `Unable to load persona for ${steamId}`, error);
-    }
+  const displayName = client.users[steamId]?.player_name ?? steamId;
+  try {
+    spool.enqueue({
+      platform: "steam",
+      event_id: `${steamId}:${identity}`,
+      conversation_id: steamId,
+      display_name: displayName,
+      sender_id: direction === "outbound_native" ? (accountId ?? "self") : steamId,
+      sender_name: direction === "outbound_native" ? "You" : displayName,
+      message_id: identity,
+      text,
+      reply_to_message_id: null,
+      attachments,
+      direction,
+    });
+  } catch (error) {
+    log("ERROR", `Unable to persist observed Steam event ${steamId}:${identity}`, error);
+    stopForSpoolFailure(error);
   }
-  const displayName = persona?.player_name ?? steamId;
-  await deliverToCore({
-    platform: "steam",
-    event_id: `${steamId}:${identity}`,
-    conversation_id: steamId,
-    display_name: displayName,
-    sender_id: direction === "outbound_native" ? (accountId ?? "self") : steamId,
-    sender_name: direction === "outbound_native" ? "You" : displayName,
-    message_id: identity,
-    text,
-    reply_to_message_id: null,
-    attachments,
-    direction,
-  });
 }
 
-async function deliverToCore(payload) {
+async function deliverPendingEvents() {
   let delay = 1000;
-  for (let attempt = 0; attempt < 5; attempt += 1) {
+  while (!shuttingDown) {
+    const pending = spool.peek();
+    if (!pending) {
+      await sleep(500);
+      continue;
+    }
     try {
       const response = await fetch(`${config.coreUrl}/v1/events`, {
         method: "POST",
@@ -112,44 +140,71 @@ async function deliverToCore(payload) {
           authorization: `Bearer ${config.internalToken}`,
           "content-type": "application/json",
         },
-        body: JSON.stringify(payload),
+        body: JSON.stringify(pending.payload),
         signal: AbortSignal.timeout(90_000),
       });
-      if (response.ok) return;
-      throw new Error(`core returned HTTP ${response.status}: ${(await response.text()).slice(0, 300)}`);
-    } catch (error) {
-      if (attempt === 4) {
-        log("ERROR", `Failed to deliver Steam event ${payload.event_id}`, error);
-        return;
+      if (!response.ok) {
+        throw new Error(
+          `core returned HTTP ${response.status}: ${(await response.text()).slice(0, 300)}`,
+        );
       }
-      await new Promise((resolve) => setTimeout(resolve, delay));
-      delay = Math.min(delay * 2, 15_000);
+      spool.delete(pending.sequence);
+      delay = 1000;
+    } catch (error) {
+      spool.failAttempt(pending.sequence, error instanceof Error ? error.message : String(error));
+      log("WARN", `Steam event ${pending.eventId} remains queued`, error);
+      await sleep(delay);
+      delay = Math.min(delay * 2, 30_000);
     }
   }
 }
 
+async function withOutboundLock(key, operation) {
+  const previous = outboundLocks.get(key) ?? Promise.resolve();
+  const current = previous.catch(() => undefined).then(operation);
+  outboundLocks.set(key, current);
+  try {
+    return await current;
+  } finally {
+    if (outboundLocks.get(key) === current) outboundLocks.delete(key);
+  }
+}
+
 async function sendOutbound(metadata, image) {
-  const cached = deliveries.get(metadata.idempotency_key);
-  if (cached) return cached;
-  if (!connected) throw new Error("Steam client is not connected");
+  return withOutboundLock(metadata.idempotency_key, async () => {
+    const cached = deliveries.get(metadata.idempotency_key);
+    if (cached) return cached;
+    if (!connected) throw new Error("Steam client is not connected");
 
-  let imageUrl = null;
-  if (image) {
-    imageUrl = await imageUploader.sendImageToUser(metadata.conversation_id, image);
-    rememberBridgeValue(bridgeImageUrls, imageUrl);
-  }
+    let record = deliveries.getRecord(metadata.idempotency_key) ?? {
+      imageUrl: null,
+      textMessageId: null,
+      messageId: null,
+      completed: false,
+    };
 
-  let messageId = imageUrl ? `image:${imageUrl}` : null;
-  if (metadata.text) {
-    const sent = await client.chat.sendFriendMessage(metadata.conversation_id, metadata.text, {
-      containsBbCode: false,
-    });
-    messageId = messageIdentity(sent);
-    rememberBridgeValue(bridgeMessageIds, messageId);
-  }
-  if (!messageId) throw new Error("outbound request contains neither text nor image");
-  await deliveries.set(metadata.idempotency_key, messageId);
-  return messageId;
+    if (image && !record.imageUrl) {
+      const imageUrl = await imageUploader.sendImageToUser(metadata.conversation_id, image);
+      rememberBridgeValue(bridgeImageUrls, imageUrl);
+      await deliveries.update(metadata.idempotency_key, { imageUrl });
+      record = deliveries.getRecord(metadata.idempotency_key);
+    }
+
+    if (metadata.text && !record.textMessageId) {
+      const sent = await client.chat.sendFriendMessage(metadata.conversation_id, metadata.text, {
+        containsBbCode: false,
+      });
+      const textMessageId = messageIdentity(sent);
+      rememberBridgeValue(bridgeMessageIds, textMessageId);
+      await deliveries.update(metadata.idempotency_key, { textMessageId });
+      record = deliveries.getRecord(metadata.idempotency_key);
+    }
+
+    const messageId = record.textMessageId ?? (record.imageUrl ? `image:${record.imageUrl}` : null);
+    if (!messageId) throw new Error("outbound request contains neither text nor image");
+    await deliveries.update(metadata.idempotency_key, { messageId, completed: true });
+    return messageId;
+  });
 }
 
 async function readBody(request, maxBytes) {
@@ -214,7 +269,17 @@ const server = createServer(async (request, response) => {
   try {
     const url = new URL(request.url ?? "/", "http://steam-adapter");
     if (request.method === "GET" && url.pathname === "/health") {
-      json(response, 200, { ok: connected, connected, account_id: accountId });
+      const storeOk = spool.healthProbe();
+      const ok = connected && spoolAlive && storeOk;
+      json(response, ok ? 200 : 503, {
+        ok,
+        connected,
+        spool_alive: spoolAlive,
+        spool_error: spoolError,
+        pending_events: spool.size(),
+        store_ok: storeOk,
+        account_id: accountId,
+      });
       return;
     }
     if (request.method !== "POST" || url.pathname !== "/v1/messages") {
@@ -235,14 +300,25 @@ const server = createServer(async (request, response) => {
   }
 });
 
+const spoolTask = deliverPendingEvents().catch((error) => {
+  spoolAlive = false;
+  spoolError = error instanceof Error ? error.message : String(error);
+  log("ERROR", "Steam pending-event spool stopped", error);
+  stopForSpoolFailure(error);
+});
+
 server.listen(config.port, config.bind, () => {
   log("INFO", `Steam adapter listening on ${config.bind}:${config.port}`);
 });
 client.logOn({ refreshToken });
 
 async function shutdown() {
+  if (shuttingDown) return;
+  shuttingDown = true;
   server.close();
   client.logOff();
+  await spoolTask;
+  closeSpool();
 }
 process.on("SIGTERM", () => void shutdown());
 process.on("SIGINT", () => void shutdown());

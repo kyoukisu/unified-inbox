@@ -2,11 +2,30 @@ import { readFile } from "node:fs/promises";
 
 import { atomicWritePrivate } from "./files.mjs";
 
+function normalizeRecord(value) {
+  if (typeof value === "string") {
+    return {
+      imageUrl: null,
+      textMessageId: null,
+      messageId: value,
+      completed: true,
+    };
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  return {
+    imageUrl: typeof value.imageUrl === "string" ? value.imageUrl : null,
+    textMessageId: typeof value.textMessageId === "string" ? value.textMessageId : null,
+    messageId: typeof value.messageId === "string" ? value.messageId : null,
+    completed: value.completed === true,
+  };
+}
+
 export class DeliveryStore {
-  constructor(path, limit = 2000) {
+  constructor(path, limit = 5000) {
     this.path = path;
     this.limit = limit;
     this.deliveries = new Map();
+    this.persistChain = Promise.resolve();
   }
 
   async load() {
@@ -17,7 +36,8 @@ export class DeliveryStore {
       }
       for (const item of parsed) {
         if (Array.isArray(item) && item.length === 2) {
-          this.deliveries.set(String(item[0]), String(item[1]));
+          const record = normalizeRecord(item[1]);
+          if (record) this.deliveries.set(String(item[0]), record);
         }
       }
     } catch (error) {
@@ -28,16 +48,45 @@ export class DeliveryStore {
   }
 
   get(idempotencyKey) {
-    return this.deliveries.get(idempotencyKey);
+    const record = this.deliveries.get(idempotencyKey);
+    return record?.completed ? record.messageId : undefined;
+  }
+
+  getRecord(idempotencyKey) {
+    const record = this.deliveries.get(idempotencyKey);
+    return record ? { ...record } : null;
+  }
+
+  async update(idempotencyKey, patch) {
+    const current = this.deliveries.get(idempotencyKey) ?? {
+      imageUrl: null,
+      textMessageId: null,
+      messageId: null,
+      completed: false,
+    };
+    this.deliveries.delete(idempotencyKey);
+    this.deliveries.set(idempotencyKey, { ...current, ...patch });
+    this.#prune();
+    await this.#persist();
   }
 
   async set(idempotencyKey, messageId) {
-    this.deliveries.delete(idempotencyKey);
-    this.deliveries.set(idempotencyKey, messageId);
+    await this.update(idempotencyKey, { messageId, completed: true });
+  }
+
+  #prune() {
     while (this.deliveries.size > this.limit) {
-      const oldest = this.deliveries.keys().next().value;
-      this.deliveries.delete(oldest);
+      const completed = [...this.deliveries].find(([, record]) => record.completed);
+      if (!completed) return;
+      this.deliveries.delete(completed[0]);
     }
-    await atomicWritePrivate(this.path, JSON.stringify([...this.deliveries]));
+  }
+
+  async #persist() {
+    const serialized = JSON.stringify([...this.deliveries]);
+    this.persistChain = this.persistChain
+      .catch(() => undefined)
+      .then(() => atomicWritePrivate(this.path, serialized));
+    await this.persistChain;
   }
 }

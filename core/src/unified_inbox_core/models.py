@@ -6,6 +6,10 @@ from typing import Literal, cast
 
 Platform = Literal["discord", "steam"]
 Direction = Literal["inbound", "outbound_native"]
+JobSource = Literal["discord", "steam", "telegram"]
+IngressKind = Literal["external_event", "telegram_update"]
+JobKind = Literal["route_external_event", "route_telegram_update"]
+JobState = Literal["pending", "leased", "succeeded", "failed"]
 
 
 def _required_string(data: Mapping[str, object], key: str) -> str:
@@ -41,6 +45,13 @@ class Attachment:
             filename=_required_string(data, "filename"),
             mime_type=_required_string(data, "mime_type"),
         )
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "url": self.url,
+            "filename": self.filename,
+            "mime_type": self.mime_type,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,6 +107,21 @@ class InboundEvent:
             direction=direction_value,
         )
 
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "platform": self.platform,
+            "event_id": self.event_id,
+            "conversation_id": self.conversation_id,
+            "display_name": self.display_name,
+            "sender_id": self.sender_id,
+            "sender_name": self.sender_name,
+            "message_id": self.message_id,
+            "text": self.text,
+            "reply_to_message_id": self.reply_to_message_id,
+            "attachments": [attachment.to_mapping() for attachment in self.attachments],
+            "direction": self.direction,
+        }
+
 
 @dataclass(frozen=True, slots=True)
 class Conversation:
@@ -115,3 +141,48 @@ class OutboundMessage:
     image: bytes | None
     image_filename: str | None
     image_mime_type: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class EnqueueResult:
+    job_id: int | None
+    created: bool
+    state: JobState | Literal["legacy_succeeded"]
+
+
+@dataclass(frozen=True, slots=True)
+class DeliveryJob:
+    id: int
+    source: JobSource
+    event_id: str
+    kind: JobKind
+    conversation_key: str
+    payload_json: str
+    telegram_message_id: int | None
+    state: JobState
+    attempt_count: int
+    available_at: float
+    lease_expires_at: float | None
+    last_error: str | None
+    created_at: float
+    updated_at: float
+
+
+@dataclass(frozen=True, slots=True)
+class FailureSummary:
+    job_id: int
+    source: JobSource
+    event_id: str
+    conversation_key: str
+    attempt_count: int
+    error: str
+    created_at: float
+    updated_at: float
+
+
+@dataclass(frozen=True, slots=True)
+class LegacyFailure:
+    source: JobSource
+    event_id: str
+    error: str
+    updated_at: str

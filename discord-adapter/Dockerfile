@@ -17,7 +17,9 @@ WORKDIR /app
 COPY pyproject.toml uv.lock ./
 COPY discord-adapter ./discord-adapter
 COPY core/pyproject.toml ./core/pyproject.toml
-RUN uv sync --frozen --no-dev --package unified-inbox-discord-adapter
+RUN uv sync --frozen --no-dev --package unified-inbox-discord-adapter \
+    && mkdir -p /data \
+    && chown "${APP_UID}:0" /data
 
 USER ${APP_UID}:0
 CMD ["unified-inbox-discord"]

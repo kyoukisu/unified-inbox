@@ -5,6 +5,8 @@ import hashlib
 import io
 import logging
 import mimetypes
+from collections.abc import Sequence
+from urllib.parse import parse_qs, urlsplit
 
 import aiohttp
 import discord
@@ -38,6 +40,127 @@ def discord_nonce_value(value: object) -> int | None:
         except ValueError:
             return None
     return None
+
+
+def discord_embed_attachments(
+    embeds: Sequence[discord.Embed],
+    excluded_urls: set[str],
+) -> tuple[list[dict[str, object]], set[str]]:
+    attachments: list[dict[str, object]] = []
+    image_urls: set[str] = set()
+    seen_urls = set(excluded_urls)
+    mime_by_format = {
+        "gif": "image/gif",
+        "jpeg": "image/jpeg",
+        "jpg": "image/jpeg",
+        "png": "image/png",
+        "webp": "image/webp",
+    }
+
+    for embed in embeds:
+        if embed.type != "image":
+            continue
+        media = embed.image if isinstance(embed.image.proxy_url, str) else embed.thumbnail
+        source_url = media.url
+        proxy_url = media.proxy_url
+        embed_url = embed.url
+        if not isinstance(proxy_url, str) or proxy_url in seen_urls:
+            continue
+        if isinstance(source_url, str) and source_url in seen_urls:
+            continue
+
+        parsed_proxy = urlsplit(proxy_url)
+        image_format = parse_qs(parsed_proxy.query).get("format", [""])[0].lower()
+        filename_url = source_url if isinstance(source_url, str) else proxy_url
+        filename = urlsplit(filename_url).path.rsplit("/", 1)[-1] or "embedded-image"
+        media_content_type: object = getattr(media, "content_type", None)
+        mime_type = mime_by_format.get(image_format)
+        if mime_type is None and isinstance(media_content_type, str):
+            mime_type = media_content_type
+        mime_type = mime_type or mimetypes.guess_type(filename)[0]
+        if mime_type is None or not mime_type.startswith("image/"):
+            mime_type = "image/jpeg"
+            filename = f"{filename}.jpg"
+        elif image_format in mime_by_format:
+            extension = "jpg" if image_format == "jpeg" else image_format
+            stem = filename.rsplit(".", 1)[0]
+            filename = f"{stem}.{extension}"
+
+        attachments.append(
+            {
+                "url": proxy_url,
+                "filename": filename,
+                "mime_type": mime_type,
+            }
+        )
+        for value in (source_url, proxy_url, embed_url):
+            if isinstance(value, str):
+                image_urls.add(value)
+                image_urls.add(_url_without_query(value))
+        seen_urls.add(proxy_url)
+        if isinstance(source_url, str):
+            seen_urls.add(source_url)
+
+    return attachments, image_urls
+
+
+def _url_without_query(value: str) -> str:
+    try:
+        return urlsplit(value)._replace(query="", fragment="").geturl()
+    except ValueError:
+        return value
+
+
+def discord_direct_image_attachment(
+    text: str | None,
+) -> tuple[dict[str, object] | None, set[str]]:
+    if text is None:
+        return None, set()
+    stripped = text.strip()
+    try:
+        parsed = urlsplit(stripped)
+        port = parsed.port
+    except ValueError:
+        return None, set()
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or port
+    ):
+        return None, set()
+
+    mime_by_format = {
+        "gif": "image/gif",
+        "jpeg": "image/jpeg",
+        "jpg": "image/jpeg",
+        "png": "image/png",
+        "webp": "image/webp",
+    }
+    image_format = parse_qs(parsed.query).get("format", [""])[0].lower()
+    filename = parsed.path.rsplit("/", 1)[-1]
+    mime_type = mime_by_format.get(image_format) or mimetypes.guess_type(filename)[0]
+    if mime_type is None or not mime_type.startswith("image/"):
+        return None, set()
+    if image_format in mime_by_format:
+        extension = "jpg" if image_format == "jpeg" else image_format
+        stem = filename.rsplit(".", 1)[0] or "embedded-image"
+        filename = f"{stem}.{extension}"
+
+    return (
+        {"url": stripped, "filename": filename, "mime_type": mime_type},
+        {stripped, _url_without_query(stripped)},
+    )
+
+
+def discord_text_without_embedded_image(text: str | None, image_urls: set[str]) -> str | None:
+    if text is None:
+        return None
+    stripped = text.strip()
+    if stripped in image_urls or _url_without_query(stripped) in image_urls:
+        return None
+    return text
 
 
 class DiscordBridgeClient(discord.Client):
@@ -107,6 +230,7 @@ class DiscordBridgeClient(discord.Client):
                 return
 
         attachments: list[dict[str, object]] = []
+        attachment_urls: set[str] = set()
         for attachment in message.attachments:
             mime_type = attachment.content_type or mimetypes.guess_type(attachment.filename)[0]
             if mime_type is None or not mime_type.startswith("image/"):
@@ -118,8 +242,26 @@ class DiscordBridgeClient(discord.Client):
                     "mime_type": mime_type,
                 }
             )
+            attachment_urls.add(attachment.url)
 
-        text = message.content if message.content else None
+        embedded_attachments, embedded_image_urls = discord_embed_attachments(
+            message.embeds,
+            attachment_urls,
+        )
+        attachments.extend(embedded_attachments)
+        if not embedded_attachments:
+            direct_attachment, direct_image_urls = discord_direct_image_attachment(
+                message.content if message.content else None
+            )
+            if direct_attachment is not None:
+                embedded_image_urls.update(direct_image_urls)
+                if direct_attachment["url"] not in attachment_urls:
+                    attachments.append(direct_attachment)
+
+        text = discord_text_without_embedded_image(
+            message.content if message.content else None,
+            embedded_image_urls,
+        )
         if text is None and not attachments:
             return
 

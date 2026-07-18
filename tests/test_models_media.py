@@ -48,8 +48,13 @@ def test_media_url_allowlist_blocks_credentials_ports_and_lookalikes() -> None:
         "steam",
         "https://images.akamai.steamusercontent.com/ugc/image.jpg",
     )
+    assert is_allowed_media_url(
+        "discord",
+        "https://i.gyazo.com/4bb631b00ba6ab9b2fd7a736cba31451.png",
+    )
 
     assert not is_allowed_media_url("discord", "http://cdn.discordapp.com/image.png")
     assert not is_allowed_media_url("discord", "https://discordapp.com.evil.test/image.png")
+    assert not is_allowed_media_url("discord", "https://i.gyazo.com.evil.test/image.png")
     assert not is_allowed_media_url("discord", "https://user@cdn.discordapp.com/image.png")
     assert not is_allowed_media_url("steam", "https://localhost:8080/private")

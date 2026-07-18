@@ -53,7 +53,6 @@ class AdapterClient:
             form.add_field(
                 "metadata",
                 json.dumps(metadata, separators=(",", ":")),
-                content_type="application/json",
             )
             form.add_field(
                 "image",

@@ -27,6 +27,19 @@ def discord_nonce_for_idempotency_key(idempotency_key: str) -> int:
     return unsigned & ((1 << 63) - 1)
 
 
+def discord_nonce_value(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return None
+    return None
+
+
 class DiscordBridgeClient(discord.Client):
     def __init__(
         self,
@@ -81,8 +94,7 @@ class DiscordBridgeClient(discord.Client):
 
     async def _enqueue_message(self, message: discord.Message, direction: str) -> None:
         if direction == "outbound_native":
-            nonce = message.nonce
-            nonce_value = nonce if isinstance(nonce, int) else None
+            nonce_value = discord_nonce_value(message.nonce)
             if (
                 message.id in self._bridge_message_ids
                 or self._store.is_bridge_message(message.id)

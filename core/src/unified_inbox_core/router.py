@@ -172,7 +172,12 @@ class Router:
                     attachment.url,
                     self._max_image_bytes,
                 )
-                message_id = await relay.send_photo(
+                send_media = (
+                    relay.send_animation
+                    if attachment.mime_type in ("image/gif", "video/mp4")
+                    else relay.send_photo
+                )
+                message_id = await send_media(
                     self._chat_id,
                     conversation.telegram_topic_id,
                     content,

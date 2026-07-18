@@ -58,18 +58,28 @@ def discord_embed_attachments(
     }
 
     for embed in embeds:
-        if embed.type != "image":
+        if embed.type not in ("image", "gifv"):
             continue
-        media = embed.image if isinstance(embed.image.proxy_url, str) else embed.thumbnail
+        if embed.type == "gifv" and isinstance(embed.video.proxy_url, str):
+            media = embed.video
+        else:
+            media = embed.image if isinstance(embed.image.proxy_url, str) else embed.thumbnail
         source_url = media.url
         proxy_url = media.proxy_url
         embed_url = embed.url
-        if not isinstance(proxy_url, str) or proxy_url in seen_urls:
+        if not isinstance(proxy_url, str):
+            continue
+        attachment_url = proxy_url
+        if embed.type == "gifv" and isinstance(source_url, str):
+            source_host = (urlsplit(source_url).hostname or "").lower()
+            if source_host == "tenor.com" or source_host.endswith(".tenor.com"):
+                attachment_url = source_url
+        if attachment_url in seen_urls:
             continue
         if isinstance(source_url, str) and source_url in seen_urls:
             continue
 
-        parsed_proxy = urlsplit(proxy_url)
+        parsed_proxy = urlsplit(attachment_url)
         image_format = parse_qs(parsed_proxy.query).get("format", [""])[0].lower()
         filename_url = source_url if isinstance(source_url, str) else proxy_url
         filename = urlsplit(filename_url).path.rsplit("/", 1)[-1] or "embedded-image"
@@ -78,7 +88,7 @@ def discord_embed_attachments(
         if mime_type is None and isinstance(media_content_type, str):
             mime_type = media_content_type
         mime_type = mime_type or mimetypes.guess_type(filename)[0]
-        if mime_type is None or not mime_type.startswith("image/"):
+        if mime_type is None or (not mime_type.startswith("image/") and mime_type != "video/mp4"):
             mime_type = "image/jpeg"
             filename = f"{filename}.jpg"
         elif image_format in mime_by_format:
@@ -88,7 +98,7 @@ def discord_embed_attachments(
 
         attachments.append(
             {
-                "url": proxy_url,
+                "url": attachment_url,
                 "filename": filename,
                 "mime_type": mime_type,
             }
@@ -97,7 +107,7 @@ def discord_embed_attachments(
             if isinstance(value, str):
                 image_urls.add(value)
                 image_urls.add(_url_without_query(value))
-        seen_urls.add(proxy_url)
+        seen_urls.add(attachment_url)
         if isinstance(source_url, str):
             seen_urls.add(source_url)
 

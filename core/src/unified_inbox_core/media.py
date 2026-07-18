@@ -12,6 +12,7 @@ _ALLOWED_HOST_SUFFIXES: dict[str, tuple[str, ...]] = {
         ".discord.media",
         ".discord.com",
         ".i.gyazo.com",
+        ".tenor.com",
     ),
     "steam": (
         ".steamusercontent.com",

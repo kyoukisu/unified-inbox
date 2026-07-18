@@ -172,6 +172,38 @@ class TelegramClient:
         result = await self._call_form("sendPhoto", form, timeout_seconds=90)
         return self._message_id(result)
 
+    async def send_animation(
+        self,
+        chat_id: int,
+        topic_id: int,
+        animation: bytes,
+        filename: str,
+        mime_type: str,
+        caption: str | None = None,
+        reply_to_message_id: int | None = None,
+    ) -> int:
+        if caption is not None and utf16_length(caption) > 1024:
+            raise ValueError("Telegram caption exceeds 1024 UTF-16 units")
+        form = aiohttp.FormData()
+        form.add_field("chat_id", str(chat_id))
+        form.add_field("message_thread_id", str(topic_id))
+        if caption:
+            form.add_field("caption", caption)
+        if reply_to_message_id is not None:
+            form.add_field(
+                "reply_parameters",
+                json.dumps(
+                    {
+                        "message_id": reply_to_message_id,
+                        "allow_sending_without_reply": True,
+                    }
+                ),
+            )
+        form.add_field("animation", animation, filename=filename, content_type=mime_type)
+        await self._wait_for_send_slot()
+        result = await self._call_form("sendAnimation", form, timeout_seconds=90)
+        return self._message_id(result)
+
     async def set_reaction(self, chat_id: int, message_id: int, emoji: str) -> None:
         await self._wait_for_send_slot()
         await self.call(

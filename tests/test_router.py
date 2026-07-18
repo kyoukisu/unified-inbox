@@ -19,6 +19,7 @@ class FakeTelegram:
         self.created_topics: list[str] = []
         self.sent_text: list[tuple[int, str]] = []
         self.sent_photos: list[tuple[int, str | None]] = []
+        self.sent_animations: list[tuple[int, str | None, str]] = []
         self.reactions: list[tuple[int, str]] = []
 
     async def create_topic(self, chat_id: int, name: str) -> int:
@@ -40,7 +41,7 @@ class FakeTelegram:
         reply_to_message_id: int | None = None,
     ) -> int:
         self.sent_text.append((topic_id, text))
-        return 500 + len(self.sent_text) + len(self.sent_photos)
+        return 500 + len(self.sent_text) + len(self.sent_photos) + len(self.sent_animations)
 
     async def send_photo(
         self,
@@ -53,7 +54,20 @@ class FakeTelegram:
         reply_to_message_id: int | None = None,
     ) -> int:
         self.sent_photos.append((topic_id, caption))
-        return 500 + len(self.sent_text) + len(self.sent_photos)
+        return 500 + len(self.sent_text) + len(self.sent_photos) + len(self.sent_animations)
+
+    async def send_animation(
+        self,
+        chat_id: int,
+        topic_id: int,
+        animation: bytes,
+        filename: str,
+        mime_type: str,
+        caption: str | None = None,
+        reply_to_message_id: int | None = None,
+    ) -> int:
+        self.sent_animations.append((topic_id, caption, mime_type))
+        return 500 + len(self.sent_text) + len(self.sent_photos) + len(self.sent_animations)
 
     async def set_reaction(self, chat_id: int, message_id: int, emoji: str) -> None:
         self.reactions.append((message_id, emoji))
@@ -380,6 +394,55 @@ async def test_long_inbound_text_is_split_without_loss(tmp_path: Path) -> None:
 
     assert len(telegram.sent_text) == 2
     assert "".join(chunk for _, chunk in telegram.sent_text) == text
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_discord_gifv_is_sent_to_telegram_as_animation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_download_media(
+        session: aiohttp.ClientSession,
+        platform: str,
+        url: str,
+        max_bytes: int,
+    ) -> bytes:
+        assert platform == "discord"
+        assert url.endswith("running-cat.mp4")
+        return b"animation"
+
+    monkeypatch.setattr("unified_inbox_core.router.download_media", fake_download_media)
+    db = Database(tmp_path / "bridge.sqlite3")
+    telegram = FakeTelegram()
+    adapters = FakeAdapters()
+    async with aiohttp.ClientSession() as session:
+        router = Router(
+            db,
+            cast(TelegramClient, telegram),
+            cast(AdapterClient, adapters),
+            session,
+            -100123,
+            999,
+            1024,
+        )
+        router.enqueue_inbound(
+            inbound_event(
+                platform="discord",
+                text=None,
+                attachments=[
+                    {
+                        "url": "https://images-ext-1.discordapp.net/running-cat.mp4",
+                        "filename": "running-cat.mp4",
+                        "mime_type": "video/mp4",
+                    }
+                ],
+            )
+        )
+        await process_next(db, router)
+
+    assert telegram.sent_animations == [(77, None, "video/mp4")]
+    assert telegram.sent_photos == []
     db.close()
 
 

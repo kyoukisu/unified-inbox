@@ -1,4 +1,4 @@
-FROM node:24.18.0-trixie-slim
+FROM node:26.4.0-trixie-slim
 
 ARG APP_UID=1000
 

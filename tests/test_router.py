@@ -65,6 +65,20 @@ class FakeTelegram:
         return None
 
 
+class FakeAnimationTelegram(FakeTelegram):
+    async def download_message_image(
+        self,
+        message: dict[str, object],
+    ) -> TelegramImage | None:
+        if "animation" not in message:
+            return None
+        return TelegramImage(
+            content=b"animated-content",
+            filename="reaction.mp4",
+            mime_type="video/mp4",
+        )
+
+
 class FailingSecondChunkTelegram(FakeTelegram):
     def __init__(self) -> None:
         super().__init__()
@@ -267,6 +281,47 @@ async def test_authorized_telegram_message_routes_to_external_adapter(tmp_path: 
     assert outbound.text == "reply from Telegram"
     assert outbound.idempotency_key == "telegram:400"
     assert db.get_state_int("telegram_offset", 0) == 401
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_telegram_animation_routes_to_discord_without_conversion(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bridge.sqlite3")
+    db.create_conversation("discord", "dm-123", "Bob", 77)
+    telegram = FakeAnimationTelegram()
+    adapters = FakeAdapters()
+    async with aiohttp.ClientSession() as session:
+        router = Router(
+            db,
+            cast(TelegramClient, telegram),
+            cast(AdapterClient, adapters),
+            session,
+            -100123,
+            999,
+            1024,
+        )
+        router.enqueue_telegram_update(
+            {
+                "update_id": 403,
+                "message": {
+                    "message_id": 91,
+                    "message_thread_id": 77,
+                    "chat": {"id": -100123},
+                    "from": {"id": 999},
+                    "caption": "animated reply",
+                    "animation": {"file_id": "animation-file"},
+                },
+            }
+        )
+        await process_next(db, router)
+
+    assert len(adapters.sent) == 1
+    platform, outbound = adapters.sent[0]
+    assert platform == "discord"
+    assert outbound.text == "animated reply"
+    assert outbound.image == b"animated-content"
+    assert outbound.image_filename == "reaction.mp4"
+    assert outbound.image_mime_type == "video/mp4"
     db.close()
 
 

@@ -253,8 +253,14 @@ class Router:
             return
 
         image = await self._telegram.download_message_image(message)
+        if (
+            image is not None
+            and conversation.platform != "discord"
+            and not image.mime_type.startswith("image/")
+        ):
+            raise PermanentDeliveryError("Telegram animations can only be relayed to Discord")
         if text is None and image is None:
-            if any(key in message for key in ("document", "video", "animation", "audio", "voice")):
+            if any(key in message for key in ("document", "video", "audio", "voice")):
                 raise PermanentDeliveryError("this Telegram media type is not supported yet")
             return
 

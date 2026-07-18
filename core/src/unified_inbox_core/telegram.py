@@ -214,6 +214,21 @@ class TelegramClient:
                 if isinstance(document_name, str) and document_name:
                     filename = document_name
 
+        animation = message.get("animation")
+        if file_id is None and isinstance(animation, dict):
+            typed_animation = cast(dict[str, object], animation)
+            animation_file_id = typed_animation.get("file_id")
+            if isinstance(animation_file_id, str):
+                file_id = animation_file_id
+                animation_type = typed_animation.get("mime_type")
+                mime_type = animation_type if isinstance(animation_type, str) else "video/mp4"
+                animation_name = typed_animation.get("file_name")
+                if isinstance(animation_name, str) and animation_name:
+                    filename = animation_name
+                else:
+                    extension = "gif" if mime_type == "image/gif" else "mp4"
+                    filename = f"telegram-animation.{extension}"
+
         if file_id is None:
             return None
 

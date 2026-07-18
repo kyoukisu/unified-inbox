@@ -40,6 +40,25 @@ class CapturingTelegramClient(TelegramClient):
         return {"message_id": 10}
 
 
+class DownloadingTelegramClient(TelegramClient):
+    def __init__(self) -> None:
+        super().__init__(cast(aiohttp.ClientSession, object()), "token", 1024)
+
+    async def call_object(
+        self,
+        method: str,
+        payload: dict[str, object],
+        timeout_seconds: int = 30,
+    ) -> dict[str, object]:
+        assert method == "getFile"
+        assert payload == {"file_id": "animation-file"}
+        return {"file_path": "animations/file.mp4", "file_size": 5}
+
+    async def _download_file(self, file_path: str) -> bytes:
+        assert file_path == "animations/file.mp4"
+        return b"video"
+
+
 @pytest.mark.asyncio
 async def test_boolean_bot_api_results_are_accepted() -> None:
     client = InspectableTelegramClient(cast(aiohttp.ClientSession, object()), "token", 1024)
@@ -69,6 +88,26 @@ async def test_retry_after_is_preserved() -> None:
 
     assert caught.value.retryable is True
     assert caught.value.retry_after == 17
+
+
+@pytest.mark.asyncio
+async def test_telegram_animation_is_downloaded_without_conversion() -> None:
+    client = DownloadingTelegramClient()
+
+    media = await client.download_message_image(
+        {
+            "animation": {
+                "file_id": "animation-file",
+                "mime_type": "video/mp4",
+                "file_name": "reaction.mp4",
+            }
+        }
+    )
+
+    assert media is not None
+    assert media.content == b"video"
+    assert media.filename == "reaction.mp4"
+    assert media.mime_type == "video/mp4"
 
 
 @pytest.mark.asyncio

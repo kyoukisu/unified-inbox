@@ -7,10 +7,12 @@ import { loadConfig } from "./config.mjs";
 import { DeliveryStore } from "./deliveries.mjs";
 import { atomicWritePrivate, readRequiredFile } from "./files.mjs";
 import {
-  compareMessageOrder,
-  messageIdentity,
-  parseFriendMessage,
-} from "./message.mjs";
+  collectHistoryPages,
+  isAfterCursor,
+  mergeFriendMessageEvents,
+  messageCursor,
+} from "./history.mjs";
+import { messageIdentity, parseFriendMessage } from "./message.mjs";
 import { ConversationEventGate } from "./ordering.mjs";
 import { normalizeSteamPresence } from "./presence.mjs";
 import { PendingEventSpool } from "./spool.mjs";
@@ -34,14 +36,21 @@ const bridgeMessageIds = new Set();
 const bridgeImageUrls = new Set();
 const outboundLocks = new Map();
 const lastPresence = new Map();
+const knownDisplayNames = new Map();
+const bufferedFriendMessages = [];
 const presenceSessionId = randomUUID();
 let presenceSequence = 0;
 let personaRefreshTimer = null;
 let personaRefreshRunning = false;
 let reconnectWatchdog = null;
+let historySyncPending = true;
 let historySyncRunning = false;
-const messageOrderGate = new ConversationEventGate(({ message, direction }) => {
-  handleFriendMessage(message, direction);
+const messageOrderGate = new ConversationEventGate(({
+  message,
+  direction,
+  advanceCursor,
+}) => {
+  handleFriendMessage(message, direction, advanceCursor);
 });
 
 function rememberBridgeValue(values, value) {
@@ -105,6 +114,9 @@ async function refreshKnownSteamPersonas() {
   personaRefreshRunning = true;
   try {
     const conversations = await loadKnownSteamConversations();
+    for (const conversation of conversations) {
+      knownDisplayNames.set(conversation.conversation_id, conversation.display_name);
+    }
     if (conversations.length === 0) return;
     try {
       const result = await client.getPersonas(
@@ -142,43 +154,68 @@ function startPersonaRefresh() {
 async function reconcileRecentFriendMessages() {
   if (!connected || historySyncRunning) return;
   historySyncRunning = true;
-  const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
-  let observed = 0;
+  const bootstrapSince = new Date(Date.now() - 24 * 60 * 60 * 1000);
+  const cursors = spool.historyCursors();
+  const discoverySince = cursors.length > 0
+    ? new Date(Math.min(...cursors.map((cursor) => cursor.serverTimestamp)) * 1000)
+    : bootstrapSince;
+  const historyEvents = [];
+  const failedConversations = new Set();
+  let discoveryFailed = false;
   try {
     const active = await client.chat.getActiveFriendMessageSessions({
-      conversationsSince: since,
+      conversationsSince: discoverySince,
     });
     for (const session of active.sessions ?? []) {
-      if (!connected) break;
+      if (!connected) {
+        discoveryFailed = true;
+        break;
+      }
+      const conversationId = session.steamid_friend.toString();
+      const cursor = spool.historyCursor(conversationId);
       try {
-        const history = await client.chat.getFriendMessageHistory(session.steamid_friend, {
-          maxCount: 200,
-          startTime: since,
-          wantBbcode: true,
-        });
-        const messages = [...(history.messages ?? [])].sort(compareMessageOrder);
+        const messages = await collectHistoryPages(
+          (options) => client.chat.getFriendMessageHistory(session.steamid_friend, options),
+          {
+            maxCount: 100,
+            startTime: cursor
+              ? new Date(cursor.serverTimestamp * 1000)
+              : bootstrapSince,
+            startOrdinal: cursor?.ordinal,
+            wantBbcode: true,
+          },
+        );
         for (const message of messages) {
+          if (!isAfterCursor(message, cursor)) continue;
           const senderId = message.sender?.toString();
           if (!senderId) continue;
-          observeFriendMessage(
-            { ...message, steamid_friend: session.steamid_friend },
-            senderId === accountId ? "outbound_native" : "inbound",
-          );
-          observed += 1;
+          historyEvents.push({
+            message: { ...message, steamid_friend: session.steamid_friend },
+            direction: senderId === accountId ? "outbound_native" : "inbound",
+          });
         }
       } catch (error) {
-        log(
-          "WARN",
-          `Unable to reconcile Steam history for ${session.steamid_friend.toString()}`,
-          error,
-        );
+        failedConversations.add(conversationId);
+        log("WARN", `Unable to reconcile Steam history for ${conversationId}`, error);
       }
     }
-    log("INFO", `Steam history reconciliation observed ${observed} messages`);
   } catch (error) {
+    discoveryFailed = true;
     log("WARN", "Unable to load recent Steam message sessions", error);
   } finally {
+    const buffered = bufferedFriendMessages.splice(0);
+    const merged = mergeFriendMessageEvents([...historyEvents, ...buffered]);
     historySyncRunning = false;
+    historySyncPending = false;
+    for (const event of merged) {
+      const conversationId = event.message.steamid_friend.toString();
+      releaseFriendMessage(
+        event.message,
+        event.direction,
+        !discoveryFailed && !failedConversations.has(conversationId),
+      );
+    }
+    log("INFO", `Steam history reconciliation observed ${historyEvents.length} messages`);
   }
 }
 
@@ -193,6 +230,7 @@ function exitForSteamFailure(message, error = null) {
 
 client.on("loggedOn", () => {
   connected = true;
+  historySyncPending = true;
   accountId = client.steamID?.getSteamID64() ?? null;
   client.setPersona(SteamUser.EPersonaState.Invisible);
   if (reconnectWatchdog) clearTimeout(reconnectWatchdog);
@@ -203,6 +241,7 @@ client.on("loggedOn", () => {
 });
 client.on("disconnected", (result, message) => {
   connected = false;
+  historySyncPending = true;
   if (personaRefreshTimer) clearInterval(personaRefreshTimer);
   personaRefreshTimer = null;
   if (reconnectWatchdog) clearTimeout(reconnectWatchdog);
@@ -242,7 +281,9 @@ function handleSteamPresence(steamIdValue, user) {
   if (steamId === accountId) return;
   const status = normalizeSteamPresence(user?.persona_state);
   if (!status) return;
-  const displayName = user?.player_name ?? client.users[steamId]?.player_name;
+  const displayName = user?.player_name
+    ?? client.users[steamId]?.player_name
+    ?? knownDisplayNames.get(steamId);
   if (!displayName) return;
   const current = `${status}\0${displayName}`;
   if (lastPresence.get(steamId) === current) return;
@@ -266,33 +307,54 @@ function handleSteamPresence(steamIdValue, user) {
 }
 
 function observeFriendMessage(message, direction) {
-  const steamId = message.steamid_friend.toString();
-  messageOrderGate.observe(steamId, messageIdentity(message), { message, direction });
+  if (historySyncPending || historySyncRunning) {
+    bufferedFriendMessages.push({ message, direction });
+    return;
+  }
+  releaseFriendMessage(message, direction, true);
 }
 
-function handleFriendMessage(message, direction) {
+function releaseFriendMessage(message, direction, advanceCursor) {
+  const steamId = message.steamid_friend.toString();
+  messageOrderGate.observe(steamId, messageIdentity(message), {
+    message,
+    direction,
+    advanceCursor,
+  });
+}
+
+function handleFriendMessage(message, direction, advanceCursor = true) {
   const steamId = message.steamid_friend.toString();
   const user = client.users[steamId];
   if (user) handleSteamPresence(steamId, user);
   const identity = messageIdentity(message);
-  const { text, attachments } = parseFriendMessage(message);
-  if (!text && attachments.length === 0) return;
-  if (
-    direction === "outbound_native"
-    && (
+  const cursor = messageCursor(message);
+  try {
+    const { text, attachments } = parseFriendMessage(message);
+    const bridgeEcho = direction === "outbound_native" && (
       consumeBridgeValue(bridgeMessageIds, identity)
       || deliveries.hasMessageId(steamId, identity)
       || attachments.some(
         (attachment) =>
           consumeBridgeValue(bridgeImageUrls, attachment.url)
-          || deliveries.hasImageUrl(steamId, attachment.url),
+          || deliveries.hasImageUrl(steamId, attachment.url)
       )
-    )
-  ) return;
+    );
+    if (bridgeEcho || (!text && attachments.length === 0)) {
+      if (advanceCursor) {
+        spool.advanceHistoryCursor(
+          steamId,
+          cursor.serverTimestamp,
+          cursor.ordinal,
+        );
+      }
+      return;
+    }
 
-  const displayName = client.users[steamId]?.player_name ?? steamId;
-  try {
-    spool.enqueue({
+    const displayName = client.users[steamId]?.player_name
+      ?? knownDisplayNames.get(steamId)
+      ?? steamId;
+    const payload = {
       platform: "steam",
       event_id: `${steamId}:${identity}`,
       conversation_id: steamId,
@@ -304,7 +366,17 @@ function handleFriendMessage(message, direction) {
       reply_to_message_id: null,
       attachments,
       direction,
-    });
+    };
+    if (advanceCursor) {
+      spool.enqueueWithHistoryCursor(
+        payload,
+        steamId,
+        cursor.serverTimestamp,
+        cursor.ordinal,
+      );
+    } else {
+      spool.enqueue(payload);
+    }
   } catch (error) {
     log("ERROR", `Unable to persist observed Steam event ${steamId}:${identity}`, error);
     stopForSpoolFailure(error);
@@ -330,9 +402,16 @@ async function deliverPendingEvents() {
         signal: AbortSignal.timeout(90_000),
       });
       if (!response.ok) {
-        throw new Error(
-          `core returned HTTP ${response.status}: ${(await response.text()).slice(0, 300)}`,
-        );
+        const error = `core returned HTTP ${response.status}: ${(
+          await response.text()
+        ).slice(0, 300)}`;
+        if (response.status === 400) {
+          spool.quarantine(pending.sequence, error);
+          log("ERROR", `Steam event ${pending.eventId} moved to dead letter`, error);
+          delay = 1000;
+          continue;
+        }
+        throw new Error(error);
       }
       spool.delete(pending.sequence);
       delay = 1000;
@@ -472,13 +551,15 @@ const server = createServer(async (request, response) => {
     const url = new URL(request.url ?? "/", "http://steam-adapter");
     if (request.method === "GET" && url.pathname === "/health") {
       const storeOk = spool.healthProbe();
-      const ok = connected && spoolAlive && storeOk;
+      const deadLetterEvents = spool.deadLetterCount();
+      const ok = connected && spoolAlive && storeOk && deadLetterEvents === 0;
       json(response, ok ? 200 : 503, {
         ok,
         connected,
         spool_alive: spoolAlive,
         spool_error: spoolError,
         pending_events: spool.size(),
+        dead_letter_events: deadLetterEvents,
         store_ok: storeOk,
         account_id: accountId,
       });
@@ -498,7 +579,16 @@ const server = createServer(async (request, response) => {
     json(response, 200, { ok: true, message_id: messageId });
   } catch (error) {
     log("ERROR", "Steam outbound delivery failed", error);
-    json(response, 502, { error: error instanceof Error ? error.message : "delivery failed" });
+    if (error?.eresult === 84) {
+      json(response, 429, {
+        error: error instanceof Error ? error.message : "Steam rate limit exceeded",
+        retry_after: 30,
+      });
+    } else {
+      json(response, 502, {
+        error: error instanceof Error ? error.message : "delivery failed",
+      });
+    }
   }
 });
 

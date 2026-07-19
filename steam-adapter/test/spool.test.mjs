@@ -30,3 +30,52 @@ test("pending event spool survives restart and deduplicates", () => {
     rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test("message enqueue advances a durable cursor without regressing it", () => {
+  const directory = mkdtempSync(join(tmpdir(), "unified-inbox-spool-cursor-"));
+  const path = join(directory, "steam.sqlite3");
+  try {
+    const first = new PendingEventSpool(path);
+    assert.equal(
+      first.enqueueWithHistoryCursor(
+        { event_id: "steam-message-2", text: "new" },
+        "friend-1",
+        200,
+        2,
+      ),
+      true,
+    );
+    first.advanceHistoryCursor("friend-1", 199, 9);
+    first.close();
+
+    const second = new PendingEventSpool(path);
+    assert.deepEqual(second.historyCursor("friend-1"), {
+      serverTimestamp: 200,
+      ordinal: 2,
+    });
+    assert.deepEqual(second.historyCursors(), [
+      { conversationId: "friend-1", serverTimestamp: 200, ordinal: 2 },
+    ]);
+    second.close();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("permanently rejected event is quarantined transactionally", () => {
+  const directory = mkdtempSync(join(tmpdir(), "unified-inbox-spool-dead-"));
+  const path = join(directory, "steam.sqlite3");
+  try {
+    const spool = new PendingEventSpool(path);
+    spool.enqueue({ event_id: "bad-event", text: "bad" });
+    const pending = spool.peek();
+
+    assert.equal(spool.quarantine(pending.sequence, "HTTP 400"), true);
+    assert.equal(spool.size(), 0);
+    assert.equal(spool.deadLetterCount(), 1);
+    assert.equal(spool.healthProbe(), true);
+    spool.close();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});

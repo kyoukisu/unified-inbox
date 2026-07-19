@@ -13,15 +13,17 @@ function inferMimeType(url) {
 }
 
 function imageAttachment(url) {
-  const parsed = new URL(url);
-  if (parsed.protocol !== "https:") {
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== "https:") return null;
+    return {
+      url,
+      filename: basename(parsed.pathname) || "steam-image",
+      mime_type: inferMimeType(url),
+    };
+  } catch {
     return null;
   }
-  return {
-    url,
-    filename: basename(parsed.pathname) || "steam-image",
-    mime_type: inferMimeType(url),
-  };
 }
 
 export function parseFriendMessage(message) {

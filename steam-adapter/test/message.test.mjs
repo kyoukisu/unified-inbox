@@ -30,6 +30,19 @@ test("parses Steam text and embedded images", () => {
   ]);
 });
 
+test("ignores malformed Steam image URLs without dropping text", () => {
+  const parsed = parseFriendMessage({
+    message_bbcode_parsed: [
+      "before",
+      { tag: "img", attrs: { src: "not a URL" }, content: [] },
+      " after",
+    ],
+  });
+
+  assert.equal(parsed.text, "before after");
+  assert.deepEqual(parsed.attachments, []);
+});
+
 test("sorts Steam history by timestamp and ordinal", () => {
   const messages = [
     { server_timestamp: new Date("2026-07-15T10:00:01Z"), ordinal: 0 },

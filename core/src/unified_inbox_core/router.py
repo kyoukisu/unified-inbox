@@ -153,6 +153,8 @@ class Router:
 
     async def _process_inbound(self, job: DeliveryJob, event: InboundEvent) -> None:
         conversation = await self._resolve_conversation(event)
+        if self._db.telegram_message_for_external(conversation.id, event.message_id) is not None:
+            return
         relay = self._outbox_telegram if event.direction == "outbound_native" else self._telegram
 
         reply_id = None

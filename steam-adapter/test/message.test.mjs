@@ -1,7 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { messageIdentity, parseFriendMessage } from "../src/message.mjs";
+import {
+  compareMessageOrder,
+  messageIdentity,
+  parseFriendMessage,
+} from "../src/message.mjs";
 
 test("parses Steam text and embedded images", () => {
   const parsed = parseFriendMessage({
@@ -23,6 +27,22 @@ test("parses Steam text and embedded images", () => {
       filename: "picture.png",
       mime_type: "image/png",
     },
+  ]);
+});
+
+test("sorts Steam history by timestamp and ordinal", () => {
+  const messages = [
+    { server_timestamp: new Date("2026-07-15T10:00:01Z"), ordinal: 0 },
+    { server_timestamp: new Date("2026-07-15T10:00:00Z"), ordinal: 2 },
+    { server_timestamp: new Date("2026-07-15T10:00:00Z"), ordinal: 1 },
+  ];
+
+  messages.sort(compareMessageOrder);
+
+  assert.deepEqual(messages.map(messageIdentity), [
+    "1784109600:1",
+    "1784109600:2",
+    "1784109601:0",
   ]);
 });
 

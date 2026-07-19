@@ -274,6 +274,30 @@ async def test_inbound_text_creates_one_topic_and_deduplicates(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
+async def test_backfilled_message_with_existing_copy_is_not_duplicated(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bridge.sqlite3")
+    telegram = FakeTelegram()
+    adapters = FakeAdapters()
+    async with aiohttp.ClientSession() as session:
+        router = Router(
+            db,
+            cast(TelegramClient, telegram),
+            cast(AdapterClient, adapters),
+            session,
+            -100123,
+            999,
+            1024,
+        )
+        router.enqueue_inbound(inbound_event())
+        await process_next(db, router)
+        router.enqueue_inbound(inbound_event(event_id="history-replay"))
+        await process_next(db, router)
+
+    assert telegram.sent_text == [(77, "hello")]
+    db.close()
+
+
+@pytest.mark.asyncio
 async def test_native_outbound_uses_outbox_only_for_persisted_conversation(
     tmp_path: Path,
 ) -> None:

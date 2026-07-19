@@ -6,7 +6,11 @@ import SteamUser from "steam-user";
 import { loadConfig } from "./config.mjs";
 import { DeliveryStore } from "./deliveries.mjs";
 import { atomicWritePrivate, readRequiredFile } from "./files.mjs";
-import { messageIdentity, parseFriendMessage } from "./message.mjs";
+import {
+  compareMessageOrder,
+  messageIdentity,
+  parseFriendMessage,
+} from "./message.mjs";
 import { ConversationEventGate } from "./ordering.mjs";
 import { normalizeSteamPresence } from "./presence.mjs";
 import { PendingEventSpool } from "./spool.mjs";
@@ -34,6 +38,8 @@ const presenceSessionId = randomUUID();
 let presenceSequence = 0;
 let personaRefreshTimer = null;
 let personaRefreshRunning = false;
+let reconnectWatchdog = null;
+let historySyncRunning = false;
 const messageOrderGate = new ConversationEventGate(({ message, direction }) => {
   handleFriendMessage(message, direction);
 });
@@ -133,20 +139,80 @@ function startPersonaRefresh() {
   }, 60000);
 }
 
+async function reconcileRecentFriendMessages() {
+  if (!connected || historySyncRunning) return;
+  historySyncRunning = true;
+  const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
+  let observed = 0;
+  try {
+    const active = await client.chat.getActiveFriendMessageSessions({
+      conversationsSince: since,
+    });
+    for (const session of active.sessions ?? []) {
+      if (!connected) break;
+      try {
+        const history = await client.chat.getFriendMessageHistory(session.steamid_friend, {
+          maxCount: 200,
+          startTime: since,
+          wantBbcode: true,
+        });
+        const messages = [...(history.messages ?? [])].sort(compareMessageOrder);
+        for (const message of messages) {
+          const senderId = message.sender?.toString();
+          if (!senderId) continue;
+          observeFriendMessage(
+            { ...message, steamid_friend: session.steamid_friend },
+            senderId === accountId ? "outbound_native" : "inbound",
+          );
+          observed += 1;
+        }
+      } catch (error) {
+        log(
+          "WARN",
+          `Unable to reconcile Steam history for ${session.steamid_friend.toString()}`,
+          error,
+        );
+      }
+    }
+    log("INFO", `Steam history reconciliation observed ${observed} messages`);
+  } catch (error) {
+    log("WARN", "Unable to load recent Steam message sessions", error);
+  } finally {
+    historySyncRunning = false;
+  }
+}
+
+function exitForSteamFailure(message, error = null) {
+  if (shuttingDown) return;
+  log("ERROR", message, error);
+  connected = false;
+  shuttingDown = true;
+  process.exitCode = 1;
+  setTimeout(() => process.exit(1), 250);
+}
+
 client.on("loggedOn", () => {
   connected = true;
   accountId = client.steamID?.getSteamID64() ?? null;
   client.setPersona(SteamUser.EPersonaState.Invisible);
+  if (reconnectWatchdog) clearTimeout(reconnectWatchdog);
+  reconnectWatchdog = null;
   startPersonaRefresh();
+  setTimeout(() => void reconcileRecentFriendMessages(), 2000);
   log("INFO", `Steam client connected as ${accountId}`);
 });
 client.on("disconnected", (result, message) => {
   connected = false;
   if (personaRefreshTimer) clearInterval(personaRefreshTimer);
   personaRefreshTimer = null;
+  if (reconnectWatchdog) clearTimeout(reconnectWatchdog);
+  reconnectWatchdog = setTimeout(
+    () => exitForSteamFailure("Steam reconnect watchdog expired"),
+    120000,
+  );
   log("WARN", `Steam client disconnected (${result}): ${message}`);
 });
-client.on("error", (error) => log("ERROR", "Steam client error", error));
+client.on("error", (error) => exitForSteamFailure("Steam client error", error));
 client.on("refreshToken", async (token) => {
   try {
     await atomicWritePrivate(config.refreshTokenFile, token);
@@ -452,6 +518,7 @@ async function shutdown() {
   if (shuttingDown) return;
   shuttingDown = true;
   if (personaRefreshTimer) clearInterval(personaRefreshTimer);
+  if (reconnectWatchdog) clearTimeout(reconnectWatchdog);
   server.close();
   client.logOff();
   await spoolTask;

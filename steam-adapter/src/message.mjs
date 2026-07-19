@@ -67,6 +67,12 @@ export function parseFriendMessage(message) {
   return { text: text || null, attachments };
 }
 
+export function compareMessageOrder(left, right) {
+  const [leftTimestamp, leftOrdinal] = messageIdentity(left).split(":", 2).map(Number);
+  const [rightTimestamp, rightOrdinal] = messageIdentity(right).split(":", 2).map(Number);
+  return leftTimestamp - rightTimestamp || leftOrdinal - rightOrdinal;
+}
+
 export function messageIdentity(message) {
   const rawTimestamp = message.server_timestamp;
   const timestamp =

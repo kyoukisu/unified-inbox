@@ -67,15 +67,23 @@ class DiscordAdapterApplication:
     async def health(self, request: web.Request) -> web.Response:
         del request
         user = self._client.user
-        connected = user is not None and self._client.is_ready() and not self._client.is_closed()
+        connected = (
+            user is not None
+            and self._client.is_ready()
+            and not self._client.is_closed()
+            and self._client.reconciliation_complete
+        )
         store_ok = self._store.health_probe()
-        ok = connected and store_ok and self._client.spool_alive
+        dead_letter_count = self._client.dead_letter_count
+        ok = connected and store_ok and self._client.spool_alive and dead_letter_count == 0
         return web.json_response(
             {
                 "ok": ok,
                 "connected": connected,
                 "spool_alive": self._client.spool_alive,
                 "pending_events": self._client.pending_count,
+                "dead_letter_events": dead_letter_count,
+                "reconciliation_complete": self._client.reconciliation_complete,
                 "store_ok": store_ok,
                 "user_id": str(user.id) if user is not None else None,
             },

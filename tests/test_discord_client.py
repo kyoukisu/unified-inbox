@@ -1,12 +1,21 @@
+import asyncio
+from collections.abc import AsyncIterator
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
 
+import aiohttp
 import discord
 import pytest
 
 from discord_adapter.client import (
+    CoreDeliveryError,
+    DiscordBridgeClient,
     discord_direct_image_attachment,
     discord_embed_attachments,
+    discord_history_newer_than,
+    discord_messages_oldest_first,
     discord_nonce_for_idempotency_key,
     discord_nonce_value,
     discord_text_without_embedded_image,
@@ -14,6 +23,7 @@ from discord_adapter.client import (
     normalize_discord_presence,
     wait_for_discord_embed,
 )
+from discord_adapter.store import AdapterStore
 
 
 @pytest.mark.asyncio
@@ -46,6 +56,97 @@ async def test_waits_for_discord_to_generate_tenor_embed() -> None:
     assert channel.calls == 1
     assert is_tenor_view_url("https://tenor.com/view/cat-gif-123")
     assert not is_tenor_view_url("look https://tenor.com/view/cat-gif-123")
+
+
+def test_discord_messages_are_deduplicated_and_sorted_oldest_first() -> None:
+    message_100 = cast(discord.Message, SimpleNamespace(id=100))
+    message_200 = cast(discord.Message, SimpleNamespace(id=200))
+    duplicate_200 = cast(discord.Message, SimpleNamespace(id=200))
+    message_300 = cast(discord.Message, SimpleNamespace(id=300))
+
+    ordered = discord_messages_oldest_first(
+        [message_300, message_200],
+        [message_100, duplicate_200],
+    )
+
+    assert [message.id for message in ordered] == [100, 200, 300]
+    assert ordered[1] is duplicate_200
+
+
+@pytest.mark.asyncio
+async def test_discord_history_uses_watermark_or_24_hour_bootstrap() -> None:
+    messages = [
+        cast(discord.Message, SimpleNamespace(id=100)),
+        cast(discord.Message, SimpleNamespace(id=200)),
+    ]
+
+    class FakeChannel:
+        def __init__(self) -> None:
+            self.after_values: list[object] = []
+
+        def history(
+            self,
+            *,
+            limit: int | None,
+            after: object,
+            oldest_first: bool,
+        ) -> AsyncIterator[discord.Message]:
+            assert limit is None
+            assert oldest_first is True
+            self.after_values.append(after)
+
+            async def iterate() -> AsyncIterator[discord.Message]:
+                for message in messages:
+                    yield message
+
+            return iterate()
+
+    channel = FakeChannel()
+    discord_channel = cast(discord.DMChannel, channel)
+    bootstrap_after = datetime.now(UTC) - timedelta(hours=24)
+
+    assert await discord_history_newer_than(discord_channel, 99, bootstrap_after) == messages
+    watermark_after = channel.after_values[-1]
+    assert isinstance(watermark_after, discord.Object)
+    assert watermark_after.id == 99
+
+    assert await discord_history_newer_than(discord_channel, None, bootstrap_after) == messages
+    assert channel.after_values[-1] is bootstrap_after
+
+
+@pytest.mark.asyncio
+async def test_core_http_400_is_quarantined_without_blocking_spool(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = AdapterStore(tmp_path / "discord.sqlite3")
+    assert store.enqueue_event({"event_id": "bad"}) is True
+    assert store.enqueue_event({"event_id": "good"}) is True
+    client = DiscordBridgeClient(
+        cast(aiohttp.ClientSession, object()),
+        "http://core.invalid",
+        "token",
+        store,
+    )
+    delivered = asyncio.Event()
+
+    async def post_to_core(payload: dict[str, object]) -> None:
+        if payload["event_id"] == "bad":
+            raise CoreDeliveryError(400, "invalid event")
+        delivered.set()
+
+    monkeypatch.setattr(client, "_post_to_core", post_to_core)
+    client.start_spool()
+    spool = client.spool_task
+    assert spool is not None
+    try:
+        await asyncio.wait_for(delivered.wait(), timeout=1)
+        assert store.pending_count() == 0
+        assert store.dead_letter_count() == 1
+    finally:
+        spool.cancel()
+        await asyncio.gather(spool, return_exceptions=True)
+        store.close()
 
 
 def test_discord_presence_statuses_are_normalized() -> None:

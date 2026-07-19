@@ -6,6 +6,7 @@ import io
 import logging
 import mimetypes
 from collections.abc import Sequence
+from datetime import UTC, datetime, timedelta
 from typing import Literal
 from urllib.parse import parse_qs, urlsplit
 from uuid import uuid4
@@ -20,6 +21,10 @@ _LOGGER = logging.getLogger(__name__)
 
 class CoreDeliveryError(RuntimeError):
     """Raised when an inbound Discord event cannot reach the core."""
+
+    def __init__(self, status: int, body: str) -> None:
+        self.status = status
+        super().__init__(f"core returned HTTP {status}: {body[:300]}")
 
 
 DiscordPresence = Literal["online", "idle", "busy", "offline"]
@@ -229,6 +234,33 @@ def discord_text_without_embedded_image(text: str | None, image_urls: set[str]) 
     return text
 
 
+def discord_messages_oldest_first(
+    *message_groups: Sequence[discord.Message],
+) -> list[discord.Message]:
+    messages_by_id = {
+        message.id: message for message_group in message_groups for message in message_group
+    }
+    return sorted(messages_by_id.values(), key=lambda message: message.id)
+
+
+async def discord_history_newer_than(
+    channel: discord.DMChannel | discord.GroupChannel,
+    watermark: int | None,
+    bootstrap_after: datetime,
+) -> list[discord.Message]:
+    after: discord.Object | datetime = (
+        discord.Object(id=watermark) if watermark is not None else bootstrap_after
+    )
+    return [
+        message
+        async for message in channel.history(
+            limit=None,
+            after=after,
+            oldest_first=True,
+        )
+    ]
+
+
 class DiscordBridgeClient(discord.Client):
     def __init__(
         self,
@@ -246,6 +278,13 @@ class DiscordBridgeClient(discord.Client):
         self._bridge_nonces: set[int] = set()
         self._event_locks: dict[int, asyncio.Lock] = {}
         self._outbound_locks: dict[str, asyncio.Lock] = {}
+        self._reconciliation_lock = asyncio.Lock()
+        self._reconciliation_active = True
+        self._reconciliation_complete = False
+        self._reconciliation_retry_task: asyncio.Task[None] | None = None
+        self._reconciling_channels: set[int] = set()
+        self._buffered_messages: dict[int, dict[int, discord.Message]] = {}
+        self._buffered_channels: dict[int, discord.DMChannel | discord.GroupChannel] = {}
         self._spool_wake = asyncio.Event()
         self._spool_task: asyncio.Task[None] | None = None
         self._dm_channels_by_user: dict[int, int] = {}
@@ -265,6 +304,14 @@ class DiscordBridgeClient(discord.Client):
     def pending_count(self) -> int:
         return self._store.pending_count()
 
+    @property
+    def dead_letter_count(self) -> int:
+        return self._store.dead_letter_count()
+
+    @property
+    def reconciliation_complete(self) -> bool:
+        return self._reconciliation_complete
+
     def start_spool(self) -> None:
         if self._spool_task is None:
             self._spool_task = asyncio.create_task(
@@ -272,27 +319,75 @@ class DiscordBridgeClient(discord.Client):
                 name="discord-core-spool",
             )
 
+    async def on_disconnect(self) -> None:
+        self._reconciliation_active = True
+        self._reconciliation_complete = False
+        if self._reconciliation_retry_task is not None:
+            self._reconciliation_retry_task.cancel()
+            self._reconciliation_retry_task = None
+
     async def on_ready(self) -> None:
         if self.user is None:
             raise RuntimeError("Discord ready event has no current user")
-        _LOGGER.info("Discord user session connected as %s (%s)", self.user, self.user.id)
-        self.start_spool()
-        for channel in self.private_channels:
-            self._remember_dm_channel(channel)
-        for relationship in self.relationships:
-            await self._enqueue_presence(
-                relationship.id,
-                relationship.user.display_name,
-                relationship.status,
-            )
-        for user_id in self._dm_channels_by_user:
-            if user_id in self._last_presence:
-                continue
-            for guild in self.guilds:
-                member = guild.get_member(user_id)
-                if member is not None:
-                    await self._enqueue_presence(member.id, member.display_name, member.status)
-                    break
+        async with self._reconciliation_lock:
+            self._reconciliation_active = True
+            self._reconciliation_complete = False
+            _LOGGER.info("Discord user session connected as %s (%s)", self.user, self.user.id)
+            self.start_spool()
+            for channel in self.private_channels:
+                self._remember_dm_channel(channel)
+            reconciliation_complete = await self._reconcile_private_channels()
+            self._reconciliation_active = False
+            self._reconciliation_complete = reconciliation_complete
+            if not reconciliation_complete:
+                self._schedule_reconciliation_retry()
+            for relationship in self.relationships:
+                await self._enqueue_presence(
+                    relationship.id,
+                    relationship.user.display_name,
+                    relationship.status,
+                )
+            for user_id in self._dm_channels_by_user:
+                if user_id in self._last_presence:
+                    continue
+                for guild in self.guilds:
+                    member = guild.get_member(user_id)
+                    if member is not None:
+                        await self._enqueue_presence(member.id, member.display_name, member.status)
+                        break
+
+    def _schedule_reconciliation_retry(self) -> None:
+        if self._reconciliation_complete or (
+            self._reconciliation_retry_task is not None
+            and not self._reconciliation_retry_task.done()
+        ):
+            return
+        self._reconciliation_retry_task = asyncio.create_task(
+            self._retry_reconciliation(),
+            name="discord-history-retry",
+        )
+
+    async def _retry_reconciliation(self) -> None:
+        try:
+            await asyncio.sleep(30)
+            if self._reconciliation_complete or self.is_closed() or not self.is_ready():
+                return
+            async with self._reconciliation_lock:
+                self._reconciliation_complete = await self._reconcile_private_channels()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _LOGGER.exception("Discord history reconciliation retry failed")
+            self._reconciliation_complete = False
+        finally:
+            self._reconciliation_retry_task = None
+            if (
+                not self._reconciliation_complete
+                and not self.is_closed()
+                and self.is_ready()
+                and not self._reconciliation_active
+            ):
+                self._schedule_reconciliation_retry()
 
     async def on_presence_update(
         self,
@@ -310,12 +405,91 @@ class DiscordBridgeClient(discord.Client):
     async def on_message(self, message: discord.Message) -> None:
         if self.user is None or message.guild is not None:
             return
-        self._remember_dm_channel(message.channel)
+        channel = message.channel
+        if not isinstance(channel, (discord.DMChannel, discord.GroupChannel)):
+            return
+        self._remember_dm_channel(channel)
+        channel_id = channel.id
+        if self._reconciliation_active or channel_id in self._reconciling_channels:
+            self._reconciling_channels.add(channel_id)
+            self._buffered_channels[channel_id] = channel
+            self._buffered_messages.setdefault(channel_id, {})[message.id] = message
+            return
+        await self._process_message_serialized(message)
+
+    async def _reconcile_private_channels(self) -> bool:
+        bootstrap_after = datetime.now(UTC) - timedelta(hours=24)
+        channels: dict[int, discord.DMChannel | discord.GroupChannel] = {
+            channel.id: channel for channel in self.private_channels
+        }
+        attempted: set[int] = set()
+        reconciliation_complete = True
+        while True:
+            channels.update(self._buffered_channels)
+            for channel_id in self._reconciling_channels:
+                channel = self.get_channel(channel_id)
+                if isinstance(channel, (discord.DMChannel, discord.GroupChannel)):
+                    channels[channel_id] = channel
+            pending_channel_ids = [
+                channel_id for channel_id in channels if channel_id not in attempted
+            ]
+            if not pending_channel_ids:
+                break
+            for channel_id in pending_channel_ids:
+                attempted.add(channel_id)
+                self._reconciling_channels.add(channel_id)
+                if not await self._reconcile_channel(channels[channel_id], bootstrap_after):
+                    reconciliation_complete = False
+        return reconciliation_complete and not self._reconciling_channels
+
+    async def _reconcile_channel(
+        self,
+        channel: discord.DMChannel | discord.GroupChannel,
+        bootstrap_after: datetime,
+    ) -> bool:
+        watermark = self._store.message_watermark(channel.id)
+        try:
+            history = await discord_history_newer_than(channel, watermark, bootstrap_after)
+        except Exception:
+            _LOGGER.error(
+                "Unable to reconcile Discord DM channel %s; retaining watermark %s",
+                channel.id,
+                watermark,
+                exc_info=True,
+            )
+            return False
+
+        event_lock = self._event_locks.setdefault(channel.id, asyncio.Lock())
+        async with event_lock:
+            messages = discord_messages_oldest_first(
+                history,
+                list(self._buffered_messages.pop(channel.id, {}).values()),
+            )
+            while messages:
+                for message in messages:
+                    current_watermark = self._store.message_watermark(channel.id)
+                    if current_watermark is None or message.id > current_watermark:
+                        await self._process_message(message)
+                messages = discord_messages_oldest_first(
+                    list(self._buffered_messages.pop(channel.id, {}).values())
+                )
+            self._buffered_channels.pop(channel.id, None)
+            self._reconciling_channels.discard(channel.id)
+        return True
+
+    async def _process_message_serialized(self, message: discord.Message) -> None:
         event_lock = self._event_locks.setdefault(message.channel.id, asyncio.Lock())
         async with event_lock:
-            message = await wait_for_discord_embed(message)
-            direction = "outbound_native" if message.author.id == self.user.id else "inbound"
-            await self._enqueue_message(message, direction)
+            current_watermark = self._store.message_watermark(message.channel.id)
+            if current_watermark is None or message.id > current_watermark:
+                await self._process_message(message)
+
+    async def _process_message(self, message: discord.Message) -> None:
+        message = await wait_for_discord_embed(message)
+        if self.user is None:
+            return
+        direction = "outbound_native" if message.author.id == self.user.id else "inbound"
+        await self._enqueue_message(message, direction)
 
     def _remember_dm_channel(self, channel: object) -> None:
         if isinstance(channel, discord.DMChannel):
@@ -374,6 +548,7 @@ class DiscordBridgeClient(discord.Client):
                 self._bridge_message_ids.discard(message.id)
                 if nonce_value is not None:
                     self._bridge_nonces.discard(nonce_value)
+                self._store.record_suppressed_bridge_echo(message.channel.id, message.id)
                 return
 
         attachments: list[dict[str, object]] = []
@@ -430,7 +605,11 @@ class DiscordBridgeClient(discord.Client):
             "direction": direction,
         }
         try:
-            created = self._store.enqueue_event(payload)
+            created = self._store.enqueue_message_event(
+                payload,
+                message.channel.id,
+                message.id,
+            )
         except Exception:
             _LOGGER.critical(
                 "Unable to persist observed Discord event %s; stopping adapter",
@@ -593,7 +772,25 @@ class DiscordBridgeClient(discord.Client):
                 continue
             try:
                 await self._post_to_core(pending.payload)
-            except (aiohttp.ClientError, TimeoutError, CoreDeliveryError) as exc:
+            except CoreDeliveryError as exc:
+                if exc.status == 400:
+                    self._store.quarantine_event(pending.sequence, str(exc))
+                    _LOGGER.error(
+                        "Discord event %s moved to dead letter after core HTTP 400: %s",
+                        pending.event_id,
+                        exc,
+                    )
+                    delay = 1.0
+                    continue
+                self._store.fail_event_attempt(pending.sequence, str(exc))
+                _LOGGER.warning(
+                    "Discord event %s remains queued after core delivery failure: %s",
+                    pending.event_id,
+                    exc,
+                )
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 300)
+            except (aiohttp.ClientError, TimeoutError) as exc:
                 self._store.fail_event_attempt(pending.sequence, str(exc))
                 _LOGGER.warning(
                     "Discord event %s remains queued after core delivery failure: %s",
@@ -617,7 +814,7 @@ class DiscordBridgeClient(discord.Client):
             if response.status < 300:
                 return
             body = await response.text()
-            raise CoreDeliveryError(f"core returned HTTP {response.status}: {body[:300]}")
+            raise CoreDeliveryError(response.status, body)
 
     @staticmethod
     def _missing_reply_target(exc: discord.HTTPException) -> bool:

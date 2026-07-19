@@ -16,6 +16,8 @@ def test_database_persists_conversation_and_message_mapping(tmp_path: Path) -> N
     loaded = reopened.get_conversation("steam", "76561198000000000")
     assert loaded == conversation
     assert reopened.get_conversation_by_topic(42) == conversation
+    assert reopened.list_conversations("steam") == [conversation]
+    assert reopened.list_conversations("discord") == []
     assert reopened.telegram_message_for_external(conversation.id, "1700000000:0") == 100
     assert reopened.external_message_for_telegram(conversation.id, 100) == "1700000000:0"
     assert reopened.get_presence("steam", "76561198000000000") == "online"

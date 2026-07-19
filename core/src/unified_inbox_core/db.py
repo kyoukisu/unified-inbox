@@ -635,6 +635,18 @@ class Database:
         ).fetchone()
         return self._conversation_from_row(row) if row is not None else None
 
+    def list_conversations(self, platform: Platform) -> list[Conversation]:
+        rows = self._connection.execute(
+            """
+            SELECT id, platform, external_chat_id, display_name, telegram_topic_id
+            FROM conversations
+            WHERE platform = ?
+            ORDER BY id
+            """,
+            (platform,),
+        ).fetchall()
+        return [self._conversation_from_row(row) for row in rows]
+
     def get_conversation_by_topic(self, topic_id: int) -> Conversation | None:
         row = self._connection.execute(
             """

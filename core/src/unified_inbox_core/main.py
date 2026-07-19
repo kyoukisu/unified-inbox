@@ -98,6 +98,7 @@ class CoreApplication:
     def web_application(self) -> web.Application:
         app = web.Application(client_max_size=self._settings.max_image_bytes + 1024 * 1024)
         app.router.add_get("/health", self.health)
+        app.router.add_get("/v1/conversations/{platform}", self.conversations)
         app.router.add_post("/v1/events", self.inbound_event)
         return app
 
@@ -133,6 +134,26 @@ class CoreApplication:
             "jobs": jobs,
         }
         return web.json_response(payload, status=200 if ok else 503)
+
+    async def conversations(self, request: web.Request) -> web.Response:
+        if not self._authorized(request):
+            return web.json_response({"ok": False, "error": "invalid internal token"}, status=401)
+        platform = request.match_info.get("platform")
+        if platform not in ("discord", "steam"):
+            return web.json_response({"ok": False, "error": "unknown platform"}, status=400)
+        conversations = self._db.list_conversations(platform)
+        return web.json_response(
+            {
+                "ok": True,
+                "conversations": [
+                    {
+                        "conversation_id": conversation.external_chat_id,
+                        "display_name": conversation.display_name,
+                    }
+                    for conversation in conversations
+                ],
+            }
+        )
 
     async def inbound_event(self, request: web.Request) -> web.Response:
         if not self._authorized(request):

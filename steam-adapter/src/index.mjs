@@ -31,6 +31,8 @@ const outboundLocks = new Map();
 const lastPresence = new Map();
 const presenceSessionId = randomUUID();
 let presenceSequence = 0;
+let personaRefreshTimer = null;
+let personaRefreshRunning = false;
 
 function rememberBridgeValue(values, value) {
   if (values.size >= 2048) values.delete(values.values().next().value);
@@ -69,14 +71,75 @@ function stopForSpoolFailure(error) {
   closeSpool();
 }
 
+async function loadKnownSteamConversations() {
+  const response = await fetch(`${config.coreUrl}/v1/conversations/steam`, {
+    headers: { Authorization: `Bearer ${config.internalToken}` },
+    signal: AbortSignal.timeout(10000),
+  });
+  if (!response.ok) throw new Error(`core returned HTTP ${response.status}`);
+  const payload = await response.json();
+  if (!Array.isArray(payload?.conversations)) {
+    throw new TypeError("core conversations response is invalid");
+  }
+  return payload.conversations.filter(
+    (conversation) =>
+      typeof conversation?.conversation_id === "string"
+      && conversation.conversation_id.length > 0
+      && typeof conversation?.display_name === "string"
+      && conversation.display_name.length > 0,
+  );
+}
+
+async function refreshKnownSteamPersonas() {
+  if (!connected || personaRefreshRunning) return;
+  personaRefreshRunning = true;
+  try {
+    const conversations = await loadKnownSteamConversations();
+    if (conversations.length === 0) return;
+    try {
+      const result = await client.getPersonas(
+        conversations.map((conversation) => conversation.conversation_id),
+      );
+      for (const [steamId, user] of Object.entries(result.personas ?? {})) {
+        handleSteamPresence(steamId, user);
+      }
+    } catch (error) {
+      log("WARN", "Unable to refresh one or more known Steam personas", error);
+    }
+    for (const conversation of conversations) {
+      if (!lastPresence.has(conversation.conversation_id)) {
+        handleSteamPresence(conversation.conversation_id, {
+          persona_state: SteamUser.EPersonaState.Offline,
+          player_name: conversation.display_name,
+        });
+      }
+    }
+  } catch (error) {
+    log("WARN", "Unable to load known Steam conversations", error);
+  } finally {
+    personaRefreshRunning = false;
+  }
+}
+
+function startPersonaRefresh() {
+  if (personaRefreshTimer) clearInterval(personaRefreshTimer);
+  void refreshKnownSteamPersonas();
+  personaRefreshTimer = setInterval(() => {
+    void refreshKnownSteamPersonas();
+  }, 60000);
+}
+
 client.on("loggedOn", () => {
   connected = true;
   accountId = client.steamID?.getSteamID64() ?? null;
   client.setPersona(SteamUser.EPersonaState.Invisible);
+  startPersonaRefresh();
   log("INFO", `Steam client connected as ${accountId}`);
 });
 client.on("disconnected", (result, message) => {
   connected = false;
+  if (personaRefreshTimer) clearInterval(personaRefreshTimer);
+  personaRefreshTimer = null;
   log("WARN", `Steam client disconnected (${result}): ${message}`);
 });
 client.on("error", (error) => log("ERROR", "Steam client error", error));
@@ -358,6 +421,7 @@ client.logOn({ refreshToken });
 async function shutdown() {
   if (shuttingDown) return;
   shuttingDown = true;
+  if (personaRefreshTimer) clearInterval(personaRefreshTimer);
   server.close();
   client.logOff();
   await spoolTask;

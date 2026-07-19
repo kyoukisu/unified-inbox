@@ -40,6 +40,17 @@ class CapturingTelegramClient(TelegramClient):
         return {"message_id": 10}
 
 
+class CapturingGetUpdatesClient(CapturingTelegramClient):
+    async def call(
+        self,
+        method: str,
+        payload: dict[str, object],
+        timeout_seconds: int = 30,
+    ) -> object:
+        self.calls.append((method, payload))
+        return []
+
+
 class DownloadingTelegramClient(TelegramClient):
     def __init__(self) -> None:
         super().__init__(cast(aiohttp.ClientSession, object()), "token", 1024)
@@ -88,6 +99,14 @@ async def test_retry_after_is_preserved() -> None:
 
     assert caught.value.retryable is True
     assert caught.value.retry_after == 17
+
+
+@pytest.mark.asyncio
+async def test_get_updates_requests_message_edits() -> None:
+    client = CapturingGetUpdatesClient()
+
+    assert await client.get_updates(100, 30) == []
+    assert client.calls[0][1]["allowed_updates"] == ["message", "edited_message"]
 
 
 @pytest.mark.asyncio

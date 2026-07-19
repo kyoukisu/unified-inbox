@@ -307,6 +307,9 @@ class Router:
         if conversation is None:
             await self._handle_unmapped_topic(job, message, topic_id)
             return
+        if "edited_message" in update:
+            await self._process_telegram_edit(job, conversation, message, update)
+            return
 
         text_value = message.get("text") or message.get("caption")
         text = text_value if isinstance(text_value, str) and text_value else None
@@ -397,6 +400,57 @@ class Router:
                 telegram_message_id,
                 "outbound",
             )
+
+    async def _process_telegram_edit(
+        self,
+        job: DeliveryJob,
+        conversation: Conversation,
+        message: dict[str, object],
+        update: dict[str, object],
+    ) -> None:
+        telegram_message_id = message.get("message_id")
+        if not isinstance(telegram_message_id, int):
+            raise PermanentDeliveryError("edited Telegram message has no integer message_id")
+        external_message_id = self._db.external_message_for_telegram(
+            conversation.id,
+            telegram_message_id,
+        )
+        text_value = message.get("text") or message.get("caption")
+        text = text_value if isinstance(text_value, str) and text_value else None
+        part_key = "external-edit"
+        if self._db.get_delivery_part(job.id, part_key) is not None:
+            return
+
+        if (
+            conversation.platform == "discord"
+            and external_message_id is not None
+            and (text is None or utf16_length(text) <= 2000)
+        ):
+            delivery = await self._adapters.edit(
+                conversation.platform,
+                conversation.external_chat_id,
+                external_message_id,
+                text,
+            )
+        else:
+            if text is None:
+                return
+            update_id = update.get("update_id")
+            if not isinstance(update_id, int):
+                raise PermanentDeliveryError("Telegram edit has no integer update_id")
+            delivery = await self._adapters.send(
+                conversation.platform,
+                OutboundMessage(
+                    idempotency_key=f"telegram-edit:{update_id}",
+                    conversation_id=conversation.external_chat_id,
+                    text=f"✏️ {text}",
+                    reply_to_message_id=external_message_id,
+                    image=None,
+                    image_filename=None,
+                    image_mime_type=None,
+                ),
+            )
+        self._db.store_delivery_part(job.id, part_key, delivery.message_id)
 
     async def _send_complete_text(
         self,

@@ -515,6 +515,26 @@ class DiscordBridgeClient(discord.Client):
             self._remember_bridge_value(self._bridge_message_ids, sent.id)
             return message_id
 
+    async def edit_message(
+        self,
+        conversation_id: str,
+        message_id: str,
+        text: str | None,
+    ) -> str:
+        lock = self._outbound_locks.setdefault(conversation_id, asyncio.Lock())
+        async with lock:
+            channel_id = int(conversation_id)
+            channel = self.get_channel(channel_id)
+            if channel is None:
+                channel = await self.fetch_channel(channel_id)
+            if not isinstance(channel, (discord.DMChannel, discord.GroupChannel)):
+                raise ValueError("conversation is not a Discord direct-message channel")
+            message = await channel.fetch_message(int(message_id))
+            if self.user is None or message.author.id != self.user.id:
+                raise ValueError("Discord message is not editable by the current user")
+            edited = await message.edit(content=text)
+            return str(edited.id)
+
     async def _send_discord_message(
         self,
         channel: discord.DMChannel | discord.GroupChannel,

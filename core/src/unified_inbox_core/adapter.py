@@ -73,6 +73,27 @@ class AdapterClient:
             raise AdapterError(f"{platform} adapter returned no message_id")
         return AdapterDelivery(message_id=message_id)
 
+    async def edit(
+        self,
+        platform: Platform,
+        conversation_id: str,
+        message_id: str,
+        text: str | None,
+    ) -> AdapterDelivery:
+        headers = {"Authorization": f"Bearer {self._token}"}
+        url = f"{self._urls[platform]}/v1/messages/{message_id}"
+        async with self._session.patch(
+            url,
+            json={"conversation_id": conversation_id, "text": text},
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=45),
+        ) as response:
+            payload = await self._response_payload(response)
+        edited_message_id = payload.get("message_id")
+        if not isinstance(edited_message_id, str) or not edited_message_id:
+            raise AdapterError(f"{platform} adapter returned no edited message_id")
+        return AdapterDelivery(message_id=edited_message_id)
+
     async def status(self, platform: Platform) -> dict[str, object]:
         headers = {"Authorization": f"Bearer {self._token}"}
         url = f"{self._urls[platform]}/health"

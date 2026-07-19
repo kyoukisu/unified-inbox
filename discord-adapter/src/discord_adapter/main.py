@@ -61,6 +61,7 @@ class DiscordAdapterApplication:
         app = web.Application(client_max_size=self._settings.max_image_bytes + 1024 * 1024)
         app.router.add_get("/health", self.health)
         app.router.add_post("/v1/messages", self.send_message)
+        app.router.add_patch("/v1/messages/{message_id}", self.edit_message)
         return app
 
     async def health(self, request: web.Request) -> web.Response:
@@ -103,6 +104,33 @@ class DiscordAdapterApplication:
             _LOGGER.exception("Discord outbound delivery failed")
             return web.json_response({"ok": False, "error": str(exc)}, status=502)
         return web.json_response({"ok": True, "message_id": message_id})
+
+    async def edit_message(self, request: web.Request) -> web.Response:
+        if not self._authorized(request):
+            return web.json_response(
+                {"ok": False, "error": "invalid internal token"},
+                status=401,
+            )
+        try:
+            raw_object: object = await request.json()
+            if not isinstance(raw_object, dict):
+                raise ValueError("request body must be an object")
+            payload = cast(dict[str, object], raw_object)
+            message_id = self._required_string(
+                {"message_id": request.match_info.get("message_id")},
+                "message_id",
+            )
+            edited_message_id = await self._client.edit_message(
+                conversation_id=self._required_string(payload, "conversation_id"),
+                message_id=message_id,
+                text=self._optional_string(payload, "text"),
+            )
+        except (ValueError, json.JSONDecodeError) as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=400)
+        except Exception as exc:
+            _LOGGER.exception("Discord message edit failed")
+            return web.json_response({"ok": False, "error": str(exc)}, status=502)
+        return web.json_response({"ok": True, "message_id": edited_message_id})
 
     async def _parse_request(
         self,

@@ -149,10 +149,21 @@ class FailingSecondChunkTelegram(FakeTelegram):
 class FakeAdapters:
     def __init__(self) -> None:
         self.sent: list[tuple[Platform, OutboundMessage]] = []
+        self.edited: list[tuple[Platform, str, str, str | None]] = []
 
     async def send(self, platform: Platform, message: OutboundMessage) -> AdapterDelivery:
         self.sent.append((platform, message))
         return AdapterDelivery(message_id=f"external-out-{len(self.sent)}")
+
+    async def edit(
+        self,
+        platform: Platform,
+        conversation_id: str,
+        message_id: str,
+        text: str | None,
+    ) -> AdapterDelivery:
+        self.edited.append((platform, conversation_id, message_id, text))
+        return AdapterDelivery(message_id=message_id)
 
     async def status(self, platform: Platform) -> dict[str, object]:
         return {"ok": True, "platform": platform}
@@ -409,6 +420,42 @@ async def test_authorized_telegram_message_routes_to_external_adapter(tmp_path: 
     assert outbound.text == "reply from Telegram"
     assert outbound.idempotency_key == "telegram:400"
     assert db.get_state_int("telegram_offset", 0) == 401
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_telegram_edit_updates_existing_discord_message(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bridge.sqlite3")
+    conversation = db.create_conversation("discord", "dm-123", "Bob", 77)
+    db.store_message_copy(conversation.id, "discord-message-55", 91, "outbound")
+    telegram = FakeTelegram()
+    adapters = FakeAdapters()
+    async with aiohttp.ClientSession() as session:
+        router = Router(
+            db,
+            cast(TelegramClient, telegram),
+            cast(AdapterClient, adapters),
+            session,
+            -100123,
+            999,
+            1024,
+        )
+        router.enqueue_telegram_update(
+            {
+                "update_id": 404,
+                "edited_message": {
+                    "message_id": 91,
+                    "message_thread_id": 77,
+                    "chat": {"id": -100123},
+                    "from": {"id": 999},
+                    "text": "corrected text",
+                },
+            }
+        )
+        await process_next(db, router)
+
+    assert adapters.edited == [("discord", "dm-123", "discord-message-55", "corrected text")]
+    assert adapters.sent == []
     db.close()
 
 

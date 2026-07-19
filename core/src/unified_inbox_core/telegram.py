@@ -77,7 +77,7 @@ class TelegramClient:
             {
                 "offset": offset,
                 "timeout": timeout_seconds,
-                "allowed_updates": ["message"],
+                "allowed_updates": ["message", "edited_message"],
             },
             timeout_seconds=timeout_seconds + 10,
         )

@@ -66,7 +66,7 @@ def test_delivery_jobs_are_durable_deduplicated_and_recover_leases(tmp_path: Pat
     reopened.close()
 
 
-def test_failed_job_blocks_only_its_conversation_until_retry(tmp_path: Path) -> None:
+def test_failed_job_does_not_block_later_jobs(tmp_path: Path) -> None:
     db = Database(tmp_path / "bridge.sqlite3")
     first = db.enqueue_external_event("steam", "first", "steam:alice", "{}")
     second = db.enqueue_external_event("steam", "second", "steam:alice", "{}")
@@ -76,6 +76,9 @@ def test_failed_job_blocks_only_its_conversation_until_retry(tmp_path: Path) -> 
     assert first_job is not None and first_job.id == first.job_id
     db.fail_job(first_job, "permanent")
 
+    next_job = db.claim_next_job(300)
+    assert next_job is not None and next_job.id == second.job_id
+    db.complete_job(next_job)
     other_job = db.claim_next_job(300)
     assert other_job is not None and other_job.id == other.job_id
     db.complete_job(other_job)
@@ -84,9 +87,6 @@ def test_failed_job_blocks_only_its_conversation_until_retry(tmp_path: Path) -> 
     assert db.retry_failed_jobs("steam:alice") == [first.job_id]
     retried = db.claim_next_job(300)
     assert retried is not None and retried.id == first.job_id
-    db.complete_job(retried)
-    unblocked = db.claim_next_job(300)
-    assert unblocked is not None and unblocked.id == second.job_id
     db.close()
 
 

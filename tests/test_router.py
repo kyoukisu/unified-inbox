@@ -17,7 +17,12 @@ from unified_inbox_core.models import (
     PresenceEvent,
 )
 from unified_inbox_core.router import Router
-from unified_inbox_core.telegram import TelegramClient, TelegramError, TelegramImage
+from unified_inbox_core.telegram import (
+    TelegramClient,
+    TelegramError,
+    TelegramImage,
+    utf16_length,
+)
 
 
 class FakeTelegram:
@@ -480,6 +485,49 @@ async def test_telegram_edit_updates_existing_discord_message(tmp_path: Path) ->
 
     assert adapters.edited == [("discord", "dm-123", "discord-message-55", "corrected text")]
     assert adapters.sent == []
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_long_telegram_edit_is_sent_as_bounded_correction_parts(
+    tmp_path: Path,
+) -> None:
+    db = Database(tmp_path / "bridge.sqlite3")
+    conversation = db.create_conversation("discord", "dm-123", "Bob", 77)
+    db.store_message_copy(conversation.id, "discord-message-55", 91, "outbound")
+    telegram = FakeTelegram()
+    adapters = FakeAdapters()
+    text = "🙂" * 1500
+    async with aiohttp.ClientSession() as session:
+        router = Router(
+            db,
+            cast(TelegramClient, telegram),
+            cast(AdapterClient, adapters),
+            session,
+            -100123,
+            999,
+            1024,
+        )
+        router.enqueue_telegram_update(
+            {
+                "update_id": 405,
+                "edited_message": {
+                    "message_id": 91,
+                    "message_thread_id": 77,
+                    "chat": {"id": -100123},
+                    "from": {"id": 999},
+                    "text": text,
+                },
+            }
+        )
+        await process_next(db, router)
+
+    messages = [outbound for _, outbound in adapters.sent]
+    assert len(messages) == 2
+    assert "".join(message.text or "" for message in messages) == f"✏️ {text}"
+    assert all(utf16_length(message.text or "") <= 2000 for message in messages)
+    assert messages[0].reply_to_message_id == "discord-message-55"
+    assert messages[1].reply_to_message_id is None
     db.close()
 
 

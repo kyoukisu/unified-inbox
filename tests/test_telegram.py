@@ -21,8 +21,12 @@ class FakeResponse:
 
 
 class InspectableTelegramClient(TelegramClient):
-    async def parse_response(self, response: aiohttp.ClientResponse) -> object:
-        return await self._parse_response("sendMessage", response)
+    async def parse_response(
+        self,
+        response: aiohttp.ClientResponse,
+        method: str = "sendMessage",
+    ) -> object:
+        return await self._parse_response(method, response)
 
 
 class CapturingTelegramClient(TelegramClient):
@@ -76,6 +80,24 @@ async def test_boolean_bot_api_results_are_accepted() -> None:
     response = cast(aiohttp.ClientResponse, FakeResponse({"ok": True, "result": True}))
 
     assert await client.parse_response(response) is True
+
+
+@pytest.mark.asyncio
+async def test_topic_not_modified_is_idempotent_success() -> None:
+    client = InspectableTelegramClient(cast(aiohttp.ClientSession, object()), "token", 1024)
+    response = cast(
+        aiohttp.ClientResponse,
+        FakeResponse(
+            {
+                "ok": False,
+                "error_code": 400,
+                "description": "Bad Request: TOPIC_NOT_MODIFIED",
+            },
+            status=400,
+        ),
+    )
+
+    assert await client.parse_response(response, "editForumTopic") is True
 
 
 @pytest.mark.asyncio

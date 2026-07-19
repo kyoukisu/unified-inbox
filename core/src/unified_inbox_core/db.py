@@ -309,7 +309,7 @@ class Database:
                       FROM delivery_jobs AS earlier
                       WHERE earlier.conversation_key = j.conversation_key
                         AND earlier.id < j.id
-                        AND earlier.state IN ('pending', 'leased', 'failed')
+                        AND earlier.state IN ('pending', 'leased')
                   )
                 ORDER BY j.id
                 LIMIT 1

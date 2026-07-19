@@ -360,6 +360,12 @@ class TelegramClient:
         raw = cast(dict[str, object], raw_object)
         if raw.get("ok") is not True:
             description = raw.get("description")
+            if (
+                method == "editForumTopic"
+                and isinstance(description, str)
+                and "TOPIC_NOT_MODIFIED" in description
+            ):
+                return True
             error_code = raw.get("error_code")
             status = error_code if isinstance(error_code, int) else response.status
             retry_after: float | None = None

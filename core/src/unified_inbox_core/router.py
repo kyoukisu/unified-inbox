@@ -419,40 +419,51 @@ class Router:
         )
         text_value = message.get("text") or message.get("caption")
         text = text_value if isinstance(text_value, str) and text_value else None
-        part_key = "external-edit"
-        if self._db.get_delivery_part(job.id, part_key) is not None:
-            return
-
         if (
             conversation.platform == "discord"
             and external_message_id is not None
             and (text is None or utf16_length(text) <= 2000)
         ):
+            part_key = "external-edit"
+            if self._db.get_delivery_part(job.id, part_key) is not None:
+                return
             delivery = await self._adapters.edit(
                 conversation.platform,
                 conversation.external_chat_id,
                 external_message_id,
                 text,
             )
-        else:
-            if text is None:
-                return
-            update_id = update.get("update_id")
-            if not isinstance(update_id, int):
-                raise PermanentDeliveryError("Telegram edit has no integer update_id")
+            self._db.store_delivery_part(job.id, part_key, delivery.message_id)
+            return
+
+        if text is None:
+            return
+        update_id = update.get("update_id")
+        if not isinstance(update_id, int):
+            raise PermanentDeliveryError("Telegram edit has no integer update_id")
+        limit = 2000 if conversation.platform == "discord" else 4096
+        chunks = split_utf16(f"✏️ {text}", limit)
+        for index, chunk in enumerate(chunks):
+            part_key = f"external-edit:{index}"
+            if self._db.get_delivery_part(job.id, part_key) is not None:
+                continue
             delivery = await self._adapters.send(
                 conversation.platform,
                 OutboundMessage(
-                    idempotency_key=f"telegram-edit:{update_id}",
+                    idempotency_key=(
+                        f"telegram-edit:{update_id}"
+                        if index == 0
+                        else f"telegram-edit:{update_id}:part:{index}"
+                    ),
                     conversation_id=conversation.external_chat_id,
-                    text=f"✏️ {text}",
-                    reply_to_message_id=external_message_id,
+                    text=chunk,
+                    reply_to_message_id=external_message_id if index == 0 else None,
                     image=None,
                     image_filename=None,
                     image_mime_type=None,
                 ),
             )
-        self._db.store_delivery_part(job.id, part_key, delivery.message_id)
+            self._db.store_delivery_part(job.id, part_key, delivery.message_id)
 
     async def _send_complete_text(
         self,

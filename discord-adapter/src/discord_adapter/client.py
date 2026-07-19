@@ -39,6 +39,43 @@ def normalize_discord_presence(value: object) -> DiscordPresence | None:
     return None
 
 
+def is_tenor_view_url(text: str | None) -> bool:
+    if text is None or text != text.strip() or any(character.isspace() for character in text):
+        return False
+    try:
+        parsed = urlsplit(text)
+    except ValueError:
+        return False
+    hostname = (parsed.hostname or "").lower()
+    return (
+        parsed.scheme == "https"
+        and hostname in ("tenor.com", "www.tenor.com")
+        and parsed.path.startswith("/view/")
+    )
+
+
+async def wait_for_discord_embed(
+    message: discord.Message,
+    delays: Sequence[float] = (0.5, 1.0, 1.5),
+) -> discord.Message:
+    if message.embeds or not is_tenor_view_url(message.content):
+        return message
+    for delay in delays:
+        await asyncio.sleep(delay)
+        try:
+            refreshed = await message.channel.fetch_message(message.id)
+        except discord.HTTPException:
+            _LOGGER.warning(
+                "Unable to refresh Discord Tenor embed for message %s",
+                message.id,
+                exc_info=True,
+            )
+            return message
+        if refreshed.embeds:
+            return refreshed
+    return message
+
+
 def discord_nonce_for_idempotency_key(idempotency_key: str) -> int:
     unsigned = int.from_bytes(
         hashlib.sha256(idempotency_key.encode()).digest()[:8],
@@ -275,6 +312,7 @@ class DiscordBridgeClient(discord.Client):
             return
         self._remember_dm_channel(message.channel)
         async with self._event_lock:
+            message = await wait_for_discord_embed(message)
             direction = "outbound_native" if message.author.id == self.user.id else "inbound"
             await self._enqueue_message(message, direction)
 

@@ -1,4 +1,8 @@
+from types import SimpleNamespace
+from typing import cast
+
 import discord
+import pytest
 
 from discord_adapter.client import (
     discord_direct_image_attachment,
@@ -6,8 +10,42 @@ from discord_adapter.client import (
     discord_nonce_for_idempotency_key,
     discord_nonce_value,
     discord_text_without_embedded_image,
+    is_tenor_view_url,
     normalize_discord_presence,
+    wait_for_discord_embed,
 )
+
+
+@pytest.mark.asyncio
+async def test_waits_for_discord_to_generate_tenor_embed() -> None:
+    refreshed = SimpleNamespace(embeds=[object()])
+
+    class FakeChannel:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def fetch_message(self, message_id: int) -> discord.Message:
+            assert message_id == 123
+            self.calls += 1
+            return cast(discord.Message, refreshed)
+
+    channel = FakeChannel()
+    message = cast(
+        discord.Message,
+        SimpleNamespace(
+            id=123,
+            content="https://tenor.com/view/cat-gif-123",
+            embeds=[],
+            channel=channel,
+        ),
+    )
+
+    result = await wait_for_discord_embed(message, delays=(0,))
+
+    assert result is refreshed
+    assert channel.calls == 1
+    assert is_tenor_view_url("https://tenor.com/view/cat-gif-123")
+    assert not is_tenor_view_url("look https://tenor.com/view/cat-gif-123")
 
 
 def test_discord_presence_statuses_are_normalized() -> None:

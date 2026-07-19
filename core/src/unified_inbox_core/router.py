@@ -27,7 +27,10 @@ from unified_inbox_core.models import (
 from unified_inbox_core.telegram import TelegramClient, TelegramImage, split_utf16, utf16_length
 
 _LOGGER = logging.getLogger(__name__)
-_PLATFORM_ICON = {"discord": "👾 Discord", "steam": "🎮 Steam"}
+_PLATFORM_TOPIC_ICON = {
+    "discord": "5417915203100613993",  # 💬
+    "steam": "5309950797704865693",  # 🎮
+}
 _PRESENCE_ICON = {"online": "🟢", "idle": "🟡", "busy": "🔴", "offline": "⚫"}
 
 
@@ -256,7 +259,8 @@ class Router:
             await self._telegram.edit_topic(
                 self._chat_id,
                 conversation.telegram_topic_id,
-                self._topic_name(event.platform, event.display_name, event.status),
+                self._topic_name(event.display_name, event.status),
+                _PLATFORM_TOPIC_ICON[event.platform],
             )
             self._db.store_delivery_part(
                 job.id,
@@ -426,7 +430,6 @@ class Router:
         if conversation is not None:
             if conversation.display_name != event.display_name:
                 topic_name = self._topic_name(
-                    event.platform,
                     event.display_name,
                     self._db.get_presence(event.platform, event.conversation_id),
                 )
@@ -434,6 +437,7 @@ class Router:
                     self._chat_id,
                     conversation.telegram_topic_id,
                     topic_name,
+                    _PLATFORM_TOPIC_ICON[event.platform],
                 )
                 self._db.update_display_name(conversation.id, event.display_name)
                 return Conversation(
@@ -452,10 +456,10 @@ class Router:
             topic_id = await self._telegram.create_topic(
                 self._chat_id,
                 self._topic_name(
-                    event.platform,
                     event.display_name,
                     self._db.get_presence(event.platform, event.conversation_id),
                 ),
+                _PLATFORM_TOPIC_ICON[event.platform],
             )
             return self._db.create_conversation(
                 event.platform,
@@ -542,7 +546,14 @@ class Router:
             await self._telegram.edit_topic(
                 self._chat_id,
                 topic_id,
-                self._topic_name(conversation.platform, display_name),
+                self._topic_name(
+                    display_name,
+                    self._db.get_presence(
+                        conversation.platform,
+                        conversation.external_chat_id,
+                    ),
+                ),
+                _PLATFORM_TOPIC_ICON[conversation.platform],
             )
             self._db.update_display_name(conversation.id, display_name)
         elif command in ("/close", "/archive"):
@@ -609,12 +620,11 @@ class Router:
 
     @staticmethod
     def _topic_name(
-        platform: str,
         display_name: str,
         status: PresenceStatus | None = None,
     ) -> str:
         presence = f"{_PRESENCE_ICON[status]} " if status is not None else ""
-        name = f"{presence}{_PLATFORM_ICON[platform]} · {display_name}"
+        name = f"{presence}{display_name}"
         if utf16_length(name) <= 128:
             return name
         return f"{split_utf16(name, 127)[0]}…"

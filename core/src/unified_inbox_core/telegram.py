@@ -90,25 +90,40 @@ class TelegramClient:
                 updates.append(cast(dict[str, object], item))
         return updates
 
-    async def create_topic(self, chat_id: int, name: str) -> int:
+    async def create_topic(
+        self,
+        chat_id: int,
+        name: str,
+        icon_custom_emoji_id: str | None = None,
+    ) -> int:
         if utf16_length(name) > 128:
             raise ValueError("Telegram topic name exceeds 128 UTF-16 units")
-        result = await self.call_object(
-            "createForumTopic",
-            {"chat_id": chat_id, "name": name},
-        )
+        payload: dict[str, object] = {"chat_id": chat_id, "name": name}
+        if icon_custom_emoji_id is not None:
+            payload["icon_custom_emoji_id"] = icon_custom_emoji_id
+        result = await self.call_object("createForumTopic", payload)
         topic_id = result.get("message_thread_id")
         if not isinstance(topic_id, int):
             raise TelegramError("createForumTopic returned no message_thread_id")
         return topic_id
 
-    async def edit_topic(self, chat_id: int, topic_id: int, name: str) -> None:
+    async def edit_topic(
+        self,
+        chat_id: int,
+        topic_id: int,
+        name: str,
+        icon_custom_emoji_id: str | None = None,
+    ) -> None:
         if utf16_length(name) > 128:
             raise ValueError("Telegram topic name exceeds 128 UTF-16 units")
-        await self.call(
-            "editForumTopic",
-            {"chat_id": chat_id, "message_thread_id": topic_id, "name": name},
-        )
+        payload: dict[str, object] = {
+            "chat_id": chat_id,
+            "message_thread_id": topic_id,
+            "name": name,
+        }
+        if icon_custom_emoji_id is not None:
+            payload["icon_custom_emoji_id"] = icon_custom_emoji_id
+        await self.call("editForumTopic", payload)
 
     async def close_topic(self, chat_id: int, topic_id: int) -> None:
         await self.call(

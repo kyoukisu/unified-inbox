@@ -23,21 +23,36 @@ from unified_inbox_core.telegram import TelegramClient, TelegramError, TelegramI
 class FakeTelegram:
     def __init__(self) -> None:
         self.created_topics: list[str] = []
+        self.created_topic_icons: list[str | None] = []
         self.edited_topics: list[str] = []
+        self.edited_topic_icons: list[str | None] = []
         self.sent_text: list[tuple[int, str]] = []
         self.sent_photos: list[tuple[int, str | None]] = []
         self.sent_animations: list[tuple[int, str | None, str]] = []
         self.deleted_messages: list[int] = []
         self.reactions: list[tuple[int, str]] = []
 
-    async def create_topic(self, chat_id: int, name: str) -> int:
+    async def create_topic(
+        self,
+        chat_id: int,
+        name: str,
+        icon_custom_emoji_id: str | None = None,
+    ) -> int:
         assert chat_id == -100123
         self.created_topics.append(name)
+        self.created_topic_icons.append(icon_custom_emoji_id)
         return 77
 
-    async def edit_topic(self, chat_id: int, topic_id: int, name: str) -> None:
+    async def edit_topic(
+        self,
+        chat_id: int,
+        topic_id: int,
+        name: str,
+        icon_custom_emoji_id: str | None = None,
+    ) -> None:
         assert chat_id == -100123
         self.edited_topics.append(name)
+        self.edited_topic_icons.append(icon_custom_emoji_id)
 
     async def close_topic(self, chat_id: int, topic_id: int) -> None:
         return None
@@ -203,14 +218,16 @@ async def test_presence_is_persisted_and_updates_topic_without_messages(tmp_path
 
         router.enqueue_inbound(inbound_event(event_id="message-after-presence"))
         await process_next(db, router)
-        assert telegram.created_topics == ["🟢 🎮 Steam · Alice"]
+        assert telegram.created_topics == ["🟢 Alice"]
+        assert telegram.created_topic_icons == ["5309950797704865693"]
 
         router.enqueue_inbound(presence_event(event_id="presence-idle", status="idle"))
         await process_next(db, router)
         router.enqueue_inbound(presence_event(event_id="presence-idle-repeat", status="idle"))
         await process_next(db, router)
 
-    assert telegram.edited_topics == ["🟡 🎮 Steam · Alice"]
+    assert telegram.edited_topics == ["🟡 Alice"]
+    assert telegram.edited_topic_icons == ["5309950797704865693"]
     assert db.get_presence("steam", "steam-alice") == "idle"
     db.close()
 
@@ -236,7 +253,8 @@ async def test_inbound_text_creates_one_topic_and_deduplicates(tmp_path: Path) -
         assert duplicate.created is False
         await process_next(db, router)
 
-    assert telegram.created_topics == ["🎮 Steam · Alice"]
+    assert telegram.created_topics == ["Alice"]
+    assert telegram.created_topic_icons == ["5309950797704865693"]
     assert telegram.sent_text == [(77, "hello")]
     conversation = db.get_conversation("steam", "steam-alice")
     assert conversation is not None
@@ -315,7 +333,8 @@ async def test_native_outbound_creates_persisted_native_conversation(tmp_path: P
         await process_next(db, router)
 
     assert db.get_conversation("steam", "unknown-chat") is not None
-    assert inbox.created_topics == ["🎮 Steam · Unknown"]
+    assert inbox.created_topics == ["Unknown"]
+    assert inbox.created_topic_icons == ["5309950797704865693"]
     assert outbox.sent_text == [(77, "started from native client")]
     db.close()
 

@@ -244,7 +244,7 @@ class DiscordBridgeClient(discord.Client):
         self._store = store
         self._bridge_message_ids: set[int] = set()
         self._bridge_nonces: set[int] = set()
-        self._event_lock = asyncio.Lock()
+        self._event_locks: dict[int, asyncio.Lock] = {}
         self._outbound_locks: dict[str, asyncio.Lock] = {}
         self._spool_wake = asyncio.Event()
         self._spool_task: asyncio.Task[None] | None = None
@@ -311,7 +311,8 @@ class DiscordBridgeClient(discord.Client):
         if self.user is None or message.guild is not None:
             return
         self._remember_dm_channel(message.channel)
-        async with self._event_lock:
+        event_lock = self._event_locks.setdefault(message.channel.id, asyncio.Lock())
+        async with event_lock:
             message = await wait_for_discord_embed(message)
             direction = "outbound_native" if message.author.id == self.user.id else "inbound"
             await self._enqueue_message(message, direction)
@@ -457,7 +458,7 @@ class DiscordBridgeClient(discord.Client):
         image: bytes | None,
         image_filename: str | None,
     ) -> str:
-        lock = self._outbound_locks.setdefault(idempotency_key, asyncio.Lock())
+        lock = self._outbound_locks.setdefault(conversation_id, asyncio.Lock())
         async with lock:
             existing = self._store.get_outbound(idempotency_key)
             if existing is not None and existing.state == "completed" and existing.message_id:

@@ -22,15 +22,26 @@ test("delivery store persists idempotency mappings", async () => {
     assert.equal(second.get("two"), "message-2");
     assert.equal(second.get("three"), "message-3");
 
-    await second.update("partial", { imageUrl: "https://steam.example/image" });
+    await second.update("partial", {
+      conversationId: "steam-alice",
+      imageUrl: "https://steam.example/image",
+      textMessageId: "1700000000:1",
+    });
     const third = new DeliveryStore(path, 3);
     await third.load();
     assert.deepEqual(third.getRecord("partial"), {
+      conversationId: "steam-alice",
       imageUrl: "https://steam.example/image",
-      textMessageId: null,
+      textMessageId: "1700000000:1",
       messageId: null,
       completed: false,
     });
+    assert.equal(third.hasMessageId("steam-alice", "1700000000:1"), true);
+    assert.equal(third.hasMessageId("steam-bob", "1700000000:1"), false);
+    assert.equal(third.hasMessageId("steam-alice", "missing"), false);
+    assert.equal(third.hasImageUrl("steam-alice", "https://steam.example/image"), true);
+    assert.equal(third.hasImageUrl("steam-bob", "https://steam.example/image"), false);
+    assert.equal(third.hasImageUrl("steam-alice", "https://steam.example/missing"), false);
     assert.ok((await readFile(path, "utf8")).length > 0);
   } finally {
     await rm(directory, { recursive: true, force: true });

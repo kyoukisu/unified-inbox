@@ -5,6 +5,7 @@ import { atomicWritePrivate } from "./files.mjs";
 function normalizeRecord(value) {
   if (typeof value === "string") {
     return {
+      conversationId: null,
       imageUrl: null,
       textMessageId: null,
       messageId: value,
@@ -13,6 +14,7 @@ function normalizeRecord(value) {
   }
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   return {
+    conversationId: typeof value.conversationId === "string" ? value.conversationId : null,
     imageUrl: typeof value.imageUrl === "string" ? value.imageUrl : null,
     textMessageId: typeof value.textMessageId === "string" ? value.textMessageId : null,
     messageId: typeof value.messageId === "string" ? value.messageId : null,
@@ -57,8 +59,23 @@ export class DeliveryStore {
     return record ? { ...record } : null;
   }
 
+  hasMessageId(conversationId, messageId) {
+    return [...this.deliveries.values()].some(
+      (record) =>
+        record.conversationId === conversationId
+        && (record.textMessageId === messageId || record.messageId === messageId),
+    );
+  }
+
+  hasImageUrl(conversationId, imageUrl) {
+    return [...this.deliveries.values()].some(
+      (record) => record.conversationId === conversationId && record.imageUrl === imageUrl,
+    );
+  }
+
   async update(idempotencyKey, patch) {
     const current = this.deliveries.get(idempotencyKey) ?? {
+      conversationId: null,
       imageUrl: null,
       textMessageId: null,
       messageId: null,

@@ -7,6 +7,7 @@ import { loadConfig } from "./config.mjs";
 import { DeliveryStore } from "./deliveries.mjs";
 import { atomicWritePrivate, readRequiredFile } from "./files.mjs";
 import { messageIdentity, parseFriendMessage } from "./message.mjs";
+import { ConversationEventGate } from "./ordering.mjs";
 import { normalizeSteamPresence } from "./presence.mjs";
 import { PendingEventSpool } from "./spool.mjs";
 import { SteamImageUploader } from "./steam-image.mjs";
@@ -33,6 +34,9 @@ const presenceSessionId = randomUUID();
 let presenceSequence = 0;
 let personaRefreshTimer = null;
 let personaRefreshRunning = false;
+const messageOrderGate = new ConversationEventGate(({ message, direction }) => {
+  handleFriendMessage(message, direction);
+});
 
 function rememberBridgeValue(values, value) {
   if (values.size >= 2048) values.delete(values.values().next().value);
@@ -161,10 +165,10 @@ client.on("friendPersonasLoaded", () => {
 });
 
 client.chat.on("friendMessage", (message) => {
-  handleFriendMessage(message, "inbound");
+  observeFriendMessage(message, "inbound");
 });
 client.chat.on("friendMessageEcho", (message) => {
-  setTimeout(() => handleFriendMessage(message, "outbound_native"), 2000);
+  observeFriendMessage(message, "outbound_native");
 });
 
 function handleSteamPresence(steamIdValue, user) {
@@ -195,6 +199,11 @@ function handleSteamPresence(steamIdValue, user) {
   }
 }
 
+function observeFriendMessage(message, direction) {
+  const steamId = message.steamid_friend.toString();
+  messageOrderGate.observe(steamId, messageIdentity(message), { message, direction });
+}
+
 function handleFriendMessage(message, direction) {
   const steamId = message.steamid_friend.toString();
   const user = client.users[steamId];
@@ -206,7 +215,12 @@ function handleFriendMessage(message, direction) {
     direction === "outbound_native"
     && (
       consumeBridgeValue(bridgeMessageIds, identity)
-      || attachments.some((attachment) => consumeBridgeValue(bridgeImageUrls, attachment.url))
+      || deliveries.hasMessageId(steamId, identity)
+      || attachments.some(
+        (attachment) =>
+          consumeBridgeValue(bridgeImageUrls, attachment.url)
+          || deliveries.hasImageUrl(steamId, attachment.url),
+      )
     )
   ) return;
 
@@ -277,39 +291,55 @@ async function withOutboundLock(key, operation) {
 }
 
 async function sendOutbound(metadata, image) {
-  return withOutboundLock(metadata.idempotency_key, async () => {
+  return withOutboundLock(metadata.conversation_id, async () => {
     const cached = deliveries.get(metadata.idempotency_key);
     if (cached) return cached;
     if (!connected) throw new Error("Steam client is not connected");
 
-    let record = deliveries.getRecord(metadata.idempotency_key) ?? {
-      imageUrl: null,
-      textMessageId: null,
-      messageId: null,
-      completed: false,
-    };
+    messageOrderGate.hold(metadata.conversation_id);
+    try {
+      let record = deliveries.getRecord(metadata.idempotency_key) ?? {
+        conversationId: metadata.conversation_id,
+        imageUrl: null,
+        textMessageId: null,
+        messageId: null,
+        completed: false,
+      };
 
-    if (image && !record.imageUrl) {
-      const imageUrl = await imageUploader.sendImageToUser(metadata.conversation_id, image);
-      rememberBridgeValue(bridgeImageUrls, imageUrl);
-      await deliveries.update(metadata.idempotency_key, { imageUrl });
-      record = deliveries.getRecord(metadata.idempotency_key);
-    }
+      if (image && !record.imageUrl) {
+        const imageUrl = await imageUploader.sendImageToUser(metadata.conversation_id, image);
+        rememberBridgeValue(bridgeImageUrls, imageUrl);
+        await deliveries.update(metadata.idempotency_key, {
+          conversationId: metadata.conversation_id,
+          imageUrl,
+        });
+        record = deliveries.getRecord(metadata.idempotency_key);
+      }
 
-    if (metadata.text && !record.textMessageId) {
-      const sent = await client.chat.sendFriendMessage(metadata.conversation_id, metadata.text, {
-        containsBbCode: false,
+      if (metadata.text && !record.textMessageId) {
+        const sent = await client.chat.sendFriendMessage(metadata.conversation_id, metadata.text, {
+          containsBbCode: false,
+        });
+        const textMessageId = messageIdentity(sent);
+        rememberBridgeValue(bridgeMessageIds, textMessageId);
+        await deliveries.update(metadata.idempotency_key, {
+          conversationId: metadata.conversation_id,
+          textMessageId,
+        });
+        record = deliveries.getRecord(metadata.idempotency_key);
+      }
+
+      const messageId = record.textMessageId ?? (record.imageUrl ? `image:${record.imageUrl}` : null);
+      if (!messageId) throw new Error("outbound request contains neither text nor image");
+      await deliveries.update(metadata.idempotency_key, {
+        conversationId: metadata.conversation_id,
+        messageId,
+        completed: true,
       });
-      const textMessageId = messageIdentity(sent);
-      rememberBridgeValue(bridgeMessageIds, textMessageId);
-      await deliveries.update(metadata.idempotency_key, { textMessageId });
-      record = deliveries.getRecord(metadata.idempotency_key);
+      return messageId;
+    } finally {
+      messageOrderGate.release(metadata.conversation_id);
     }
-
-    const messageId = record.textMessageId ?? (record.imageUrl ? `image:${record.imageUrl}` : null);
-    if (!messageId) throw new Error("outbound request contains neither text nor image");
-    await deliveries.update(metadata.idempotency_key, { messageId, completed: true });
-    return messageId;
   });
 }
 

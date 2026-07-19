@@ -3,11 +3,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from pathlib import Path
 from typing import cast
 
 import aiohttp
 
 from unified_inbox_core.adapter import AdapterClient
+from unified_inbox_core.animation import DISCORD_GIF_LIMIT_BYTES, convert_mp4_to_gif
 from unified_inbox_core.db import Database
 from unified_inbox_core.errors import PermanentDeliveryError
 from unified_inbox_core.media import MediaDownloadError, download_media
@@ -22,7 +24,7 @@ from unified_inbox_core.models import (
     PresenceStatus,
     external_event_from_mapping,
 )
-from unified_inbox_core.telegram import TelegramClient, split_utf16, utf16_length
+from unified_inbox_core.telegram import TelegramClient, TelegramImage, split_utf16, utf16_length
 
 _LOGGER = logging.getLogger(__name__)
 _PLATFORM_ICON = {"discord": "👾 Discord", "steam": "🎮 Steam"}
@@ -315,6 +317,22 @@ class Router:
             and not image.mime_type.startswith("image/")
         ):
             raise PermanentDeliveryError("Telegram animations can only be relayed to Discord")
+        if (
+            image is not None
+            and conversation.platform == "discord"
+            and image.mime_type.lower() == "video/mp4"
+        ):
+            self._db.renew_job_lease(job.id, 300)
+            converted = await convert_mp4_to_gif(
+                image.content,
+                min(self._max_image_bytes, DISCORD_GIF_LIMIT_BYTES),
+            )
+            if converted is not None:
+                image = TelegramImage(
+                    content=converted,
+                    filename=f"{Path(image.filename).stem}.gif",
+                    mime_type="image/gif",
+                )
         if text is None and image is None:
             if any(key in message for key in ("document", "video", "audio", "voice")):
                 raise PermanentDeliveryError("this Telegram media type is not supported yet")

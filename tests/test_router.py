@@ -394,7 +394,16 @@ async def test_authorized_telegram_message_routes_to_external_adapter(tmp_path: 
 
 
 @pytest.mark.asyncio
-async def test_telegram_animation_routes_to_discord_without_conversion(tmp_path: Path) -> None:
+async def test_telegram_animation_routes_to_discord_as_gif(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_convert(content: bytes, max_output_bytes: int) -> bytes:
+        assert content == b"animated-content"
+        assert max_output_bytes == 1024
+        return b"GIF89a-converted"
+
+    monkeypatch.setattr("unified_inbox_core.router.convert_mp4_to_gif", fake_convert)
     db = Database(tmp_path / "bridge.sqlite3")
     db.create_conversation("discord", "dm-123", "Bob", 77)
     telegram = FakeAnimationTelegram()
@@ -428,9 +437,9 @@ async def test_telegram_animation_routes_to_discord_without_conversion(tmp_path:
     platform, outbound = adapters.sent[0]
     assert platform == "discord"
     assert outbound.text == "animated reply"
-    assert outbound.image == b"animated-content"
-    assert outbound.image_filename == "reaction.mp4"
-    assert outbound.image_mime_type == "video/mp4"
+    assert outbound.image == b"GIF89a-converted"
+    assert outbound.image_filename == "reaction.gif"
+    assert outbound.image_mime_type == "image/gif"
     db.close()
 
 

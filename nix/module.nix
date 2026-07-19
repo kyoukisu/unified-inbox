@@ -3,6 +3,12 @@
 let
   cfg = config.services.unified-inbox;
   compose = "${pkgs.docker-compose}/bin/docker-compose";
+  reload = pkgs.writeShellScript "unified-inbox-reload" ''
+    set -eu
+    ${compose} up -d --build --remove-orphans
+    ${pkgs.docker}/bin/docker image prune --force --filter until=24h || true
+    ${pkgs.docker}/bin/docker builder prune --force --filter until=168h || true
+  '';
 in
 {
   options.services.unified-inbox = {
@@ -56,7 +62,7 @@ in
           "${compose} config --quiet"
         ];
         ExecStart = "${compose} up -d --remove-orphans";
-        ExecReload = "${compose} up -d --build --remove-orphans";
+        ExecReload = reload;
         ExecStop = "${compose} down";
       };
     };

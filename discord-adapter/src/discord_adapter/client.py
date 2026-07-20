@@ -3,9 +3,10 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import io
+import json
 import logging
 import mimetypes
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Literal
 from urllib.parse import parse_qs, urlsplit
@@ -234,6 +235,22 @@ def discord_text_without_embedded_image(text: str | None, image_urls: set[str]) 
     return text
 
 
+def discord_edit_event_id(
+    message_id: int,
+    text: str | None,
+    attachments: Sequence[Mapping[str, object]],
+) -> str:
+    revision = hashlib.sha256(
+        json.dumps(
+            {"text": text, "attachments": attachments},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()[:20]
+    return f"edit:{message_id}:{revision}"
+
+
 def discord_messages_oldest_first(
     *message_groups: Sequence[discord.Message],
 ) -> list[discord.Message]:
@@ -284,6 +301,7 @@ class DiscordBridgeClient(discord.Client):
         self._reconciliation_retry_task: asyncio.Task[None] | None = None
         self._reconciling_channels: set[int] = set()
         self._buffered_messages: dict[int, dict[int, discord.Message]] = {}
+        self._buffered_edits: dict[int, dict[int, discord.Message]] = {}
         self._buffered_channels: dict[int, discord.DMChannel | discord.GroupChannel] = {}
         self._spool_wake = asyncio.Event()
         self._spool_task: asyncio.Task[None] | None = None
@@ -417,6 +435,46 @@ class DiscordBridgeClient(discord.Client):
             return
         await self._process_message_serialized(message)
 
+    async def on_message_edit(
+        self,
+        before: discord.Message,
+        after: discord.Message,
+    ) -> None:
+        del before
+        await self._observe_message_edit(after)
+
+    async def on_raw_message_edit(self, payload: discord.RawMessageUpdateEvent) -> None:
+        if payload.guild_id is not None:
+            return
+        channel = self.get_channel(payload.channel_id)
+        if not isinstance(channel, (discord.DMChannel, discord.GroupChannel)):
+            return
+        try:
+            message = await channel.fetch_message(payload.message_id)
+        except discord.HTTPException:
+            _LOGGER.warning(
+                "Unable to fetch edited Discord message %s",
+                payload.message_id,
+                exc_info=True,
+            )
+            return
+        await self._observe_message_edit(message)
+
+    async def _observe_message_edit(self, message: discord.Message) -> None:
+        if self.user is None or message.guild is not None:
+            return
+        channel = message.channel
+        if not isinstance(channel, (discord.DMChannel, discord.GroupChannel)):
+            return
+        self._remember_dm_channel(channel)
+        channel_id = channel.id
+        if self._reconciliation_active or channel_id in self._reconciling_channels:
+            self._reconciling_channels.add(channel_id)
+            self._buffered_channels[channel_id] = channel
+            self._buffered_edits.setdefault(channel_id, {})[message.id] = message
+            return
+        await self._process_message_edit_serialized(message)
+
     async def _reconcile_private_channels(self) -> bool:
         bootstrap_after = datetime.now(UTC) - timedelta(hours=24)
         channels: dict[int, discord.DMChannel | discord.GroupChannel] = {
@@ -473,6 +531,15 @@ class DiscordBridgeClient(discord.Client):
                 messages = discord_messages_oldest_first(
                     list(self._buffered_messages.pop(channel.id, {}).values())
                 )
+            edits = discord_messages_oldest_first(
+                list(self._buffered_edits.pop(channel.id, {}).values())
+            )
+            while edits:
+                for message in edits:
+                    await self._process_message_edit(message)
+                edits = discord_messages_oldest_first(
+                    list(self._buffered_edits.pop(channel.id, {}).values())
+                )
             self._buffered_channels.pop(channel.id, None)
             self._reconciling_channels.discard(channel.id)
         return True
@@ -484,12 +551,23 @@ class DiscordBridgeClient(discord.Client):
             if current_watermark is None or message.id > current_watermark:
                 await self._process_message(message)
 
+    async def _process_message_edit_serialized(self, message: discord.Message) -> None:
+        event_lock = self._event_locks.setdefault(message.channel.id, asyncio.Lock())
+        async with event_lock:
+            await self._process_message_edit(message)
+
     async def _process_message(self, message: discord.Message) -> None:
         message = await wait_for_discord_embed(message)
         if self.user is None:
             return
         direction = "outbound_native" if message.author.id == self.user.id else "inbound"
         await self._enqueue_message(message, direction)
+
+    async def _process_message_edit(self, message: discord.Message) -> None:
+        if self.user is None:
+            return
+        direction = "outbound_native" if message.author.id == self.user.id else "inbound"
+        await self._enqueue_message(message, direction, kind="message_edit")
 
     def _remember_dm_channel(self, channel: object) -> None:
         if isinstance(channel, discord.DMChannel):
@@ -536,7 +614,13 @@ class DiscordBridgeClient(discord.Client):
         if created:
             self._spool_wake.set()
 
-    async def _enqueue_message(self, message: discord.Message, direction: str) -> None:
+    async def _enqueue_message(
+        self,
+        message: discord.Message,
+        direction: str,
+        *,
+        kind: Literal["message", "message_edit"] = "message",
+    ) -> None:
         if direction == "outbound_native":
             nonce_value = discord_nonce_value(message.nonce)
             if (
@@ -591,9 +675,15 @@ class DiscordBridgeClient(discord.Client):
         if message.reference is not None and message.reference.message_id is not None:
             reply_to = str(message.reference.message_id)
 
+        event_id = (
+            str(message.id)
+            if kind == "message"
+            else discord_edit_event_id(message.id, text, attachments)
+        )
         payload: dict[str, object] = {
+            "kind": kind,
             "platform": "discord",
-            "event_id": str(message.id),
+            "event_id": event_id,
             "conversation_id": str(message.channel.id),
             "display_name": self._conversation_name(message),
             "sender_id": str(message.author.id),
@@ -605,10 +695,14 @@ class DiscordBridgeClient(discord.Client):
             "direction": direction,
         }
         try:
-            created = self._store.enqueue_message_event(
-                payload,
-                message.channel.id,
-                message.id,
+            created = (
+                self._store.enqueue_message_event(
+                    payload,
+                    message.channel.id,
+                    message.id,
+                )
+                if kind == "message"
+                else self._store.enqueue_event(payload)
             )
         except Exception:
             _LOGGER.critical(
@@ -654,7 +748,11 @@ class DiscordBridgeClient(discord.Client):
             record = self._store.begin_outbound(idempotency_key, conversation_id, nonce)
             self._remember_bridge_value(self._bridge_nonces, nonce)
             if existing is not None or record.message_id is not None:
-                reconciled = await self._find_message_by_nonce(channel, nonce)
+                reconciled = await self._find_message_by_nonce(
+                    channel,
+                    nonce,
+                    record.created_at,
+                )
                 if reconciled is not None:
                     message_id = str(reconciled.id)
                     self._store.complete_outbound(idempotency_key, message_id)
@@ -714,6 +812,24 @@ class DiscordBridgeClient(discord.Client):
             edited = await message.edit(content=text)
             return str(edited.id)
 
+    async def delete_message(
+        self,
+        conversation_id: str,
+        message_id: str,
+    ) -> None:
+        lock = self._outbound_locks.setdefault(conversation_id, asyncio.Lock())
+        async with lock:
+            channel_id = int(conversation_id)
+            channel = self.get_channel(channel_id)
+            if channel is None:
+                channel = await self.fetch_channel(channel_id)
+            if not isinstance(channel, (discord.DMChannel, discord.GroupChannel)):
+                raise ValueError("conversation is not a Discord direct-message channel")
+            message = await channel.fetch_message(int(message_id))
+            if self.user is None or message.author.id != self.user.id:
+                raise ValueError("Discord message is not deletable by the current user")
+            await message.delete()
+
     async def _send_discord_message(
         self,
         channel: discord.DMChannel | discord.GroupChannel,
@@ -751,10 +867,16 @@ class DiscordBridgeClient(discord.Client):
         self,
         channel: discord.DMChannel | discord.GroupChannel,
         nonce: int,
+        created_at: float,
     ) -> discord.Message | None:
         if self.user is None:
             return None
-        async for message in channel.history(limit=100):
+        after = datetime.fromtimestamp(max(0, created_at - 60), UTC)
+        async for message in channel.history(
+            limit=None,
+            after=after,
+            oldest_first=True,
+        ):
             if message.author.id == self.user.id and str(message.nonce) == str(nonce):
                 return message
         return None

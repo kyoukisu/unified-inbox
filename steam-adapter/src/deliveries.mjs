@@ -9,6 +9,11 @@ function normalizeRecord(value) {
       imageUrl: null,
       textMessageId: null,
       messageId: value,
+      textStartedAt: null,
+      text: null,
+      imageStartedAt: null,
+      imageSha: null,
+      updatedAt: Date.now(),
       completed: true,
     };
   }
@@ -18,14 +23,20 @@ function normalizeRecord(value) {
     imageUrl: typeof value.imageUrl === "string" ? value.imageUrl : null,
     textMessageId: typeof value.textMessageId === "string" ? value.textMessageId : null,
     messageId: typeof value.messageId === "string" ? value.messageId : null,
+    textStartedAt: Number.isFinite(value.textStartedAt) ? value.textStartedAt : null,
+    text: typeof value.text === "string" ? value.text : null,
+    imageStartedAt: Number.isFinite(value.imageStartedAt) ? value.imageStartedAt : null,
+    imageSha: typeof value.imageSha === "string" ? value.imageSha : null,
+    updatedAt: Number.isFinite(value.updatedAt) ? value.updatedAt : Date.now(),
     completed: value.completed === true,
   };
 }
 
 export class DeliveryStore {
-  constructor(path, limit = 5000) {
+  constructor(path, limit = 5000, retentionMilliseconds = 16 * 24 * 60 * 60 * 1000) {
     this.path = path;
     this.limit = limit;
+    this.retentionMilliseconds = retentionMilliseconds;
     this.deliveries = new Map();
     this.persistChain = Promise.resolve();
   }
@@ -59,6 +70,22 @@ export class DeliveryStore {
     return record ? { ...record } : null;
   }
 
+  ambiguousRecords() {
+    return [...this.deliveries]
+      .filter(
+        ([, record]) =>
+          !record.completed
+          && (
+            (record.textStartedAt && !record.textMessageId)
+            || (record.imageStartedAt && !record.imageUrl)
+          ),
+      )
+      .map(([idempotencyKey, record]) => ({
+        idempotencyKey,
+        record: { ...record },
+      }));
+  }
+
   hasMessageId(conversationId, messageId) {
     return [...this.deliveries.values()].some(
       (record) =>
@@ -79,10 +106,19 @@ export class DeliveryStore {
       imageUrl: null,
       textMessageId: null,
       messageId: null,
+      textStartedAt: null,
+      text: null,
+      imageStartedAt: null,
+      imageSha: null,
+      updatedAt: 0,
       completed: false,
     };
     this.deliveries.delete(idempotencyKey);
-    this.deliveries.set(idempotencyKey, { ...current, ...patch });
+    this.deliveries.set(idempotencyKey, {
+      ...current,
+      ...patch,
+      updatedAt: Date.now(),
+    });
     this.#prune();
     await this.#persist();
   }
@@ -92,10 +128,19 @@ export class DeliveryStore {
   }
 
   #prune() {
-    while (this.deliveries.size > this.limit) {
-      const completed = [...this.deliveries].find(([, record]) => record.completed);
-      if (!completed) return;
-      this.deliveries.delete(completed[0]);
+    const cutoff = Date.now() - this.retentionMilliseconds;
+    for (const [key, record] of this.deliveries) {
+      if (record.completed && record.updatedAt < cutoff) {
+        this.deliveries.delete(key);
+      }
+    }
+    if (this.deliveries.size <= this.limit) return;
+    const completed = [...this.deliveries]
+      .filter(([, record]) => record.completed)
+      .sort((left, right) => left[1].updatedAt - right[1].updatedAt);
+    for (const [key, record] of completed) {
+      if (this.deliveries.size <= this.limit || record.updatedAt >= cutoff) break;
+      this.deliveries.delete(key);
     }
   }
 

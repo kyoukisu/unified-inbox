@@ -94,6 +94,22 @@ class AdapterClient:
             raise AdapterError(f"{platform} adapter returned no edited message_id")
         return AdapterDelivery(message_id=edited_message_id)
 
+    async def delete(
+        self,
+        platform: Platform,
+        conversation_id: str,
+        message_id: str,
+    ) -> None:
+        headers = {"Authorization": f"Bearer {self._token}"}
+        url = f"{self._urls[platform]}/v1/messages/{message_id}"
+        async with self._session.delete(
+            url,
+            json={"conversation_id": conversation_id},
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=45),
+        ) as response:
+            await self._response_payload(response)
+
     async def status(self, platform: Platform) -> dict[str, object]:
         headers = {"Authorization": f"Bearer {self._token}"}
         url = f"{self._urls[platform]}/health"

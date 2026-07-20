@@ -90,6 +90,28 @@ def test_failed_job_does_not_block_later_jobs(tmp_path: Path) -> None:
     db.close()
 
 
+def test_external_snapshots_and_telegram_delivery_ids_are_persisted(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bridge.sqlite3")
+    conversation = db.create_conversation("discord", "dm-1", "Alice", 77)
+    db.store_external_message_snapshot(conversation.id, "message-1", '{"text":"hello"}')
+    db.store_telegram_external_parts(91, ["discord-1", "discord-2"])
+    result = db.enqueue_external_event(
+        "discord",
+        "event-1",
+        "discord:dm-1",
+        '{"message_id":"message-1"}',
+    )
+    job = db.claim_next_job(300)
+    assert job is not None and job.id == result.job_id
+    db.store_delivery_part(job.id, "text:0", "501")
+    db.store_delivery_part(job.id, "edit:text:0", "502")
+
+    assert db.get_external_message_snapshot(conversation.id, "message-1") == '{"text":"hello"}'
+    assert db.telegram_external_parts(91) == ["discord-1", "discord-2"]
+    assert db.telegram_delivery_ids_for_external_message("discord", "message-1") == [501, 502]
+    db.close()
+
+
 def test_legacy_failures_remain_visible_after_migration(tmp_path: Path) -> None:
     path = tmp_path / "bridge.sqlite3"
     db = Database(path)

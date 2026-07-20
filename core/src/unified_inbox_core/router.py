@@ -18,13 +18,20 @@ from unified_inbox_core.models import (
     DeliveryJob,
     EnqueueResult,
     ExternalEvent,
+    InboundEditEvent,
     InboundEvent,
     OutboundMessage,
     PresenceEvent,
     PresenceStatus,
     external_event_from_mapping,
 )
-from unified_inbox_core.telegram import TelegramClient, TelegramImage, split_utf16, utf16_length
+from unified_inbox_core.telegram import (
+    TelegramClient,
+    TelegramError,
+    TelegramImage,
+    split_utf16,
+    utf16_length,
+)
 
 _LOGGER = logging.getLogger(__name__)
 _PLATFORM_TOPIC_ICON = {
@@ -114,6 +121,8 @@ class Router:
                 raise PermanentDeliveryError(str(exc)) from exc
             if isinstance(event, PresenceEvent):
                 await self._process_presence(job, event)
+            elif isinstance(event, InboundEditEvent):
+                await self._process_inbound_edit(job, event)
             else:
                 await self._process_inbound(job, event)
             return
@@ -154,6 +163,7 @@ class Router:
     async def _process_inbound(self, job: DeliveryJob, event: InboundEvent) -> None:
         conversation = await self._resolve_conversation(event)
         if self._db.telegram_message_for_external(conversation.id, event.message_id) is not None:
+            self._store_external_snapshot(conversation.id, event)
             return
         relay = self._outbox_telegram if event.direction == "outbound_native" else self._telegram
 
@@ -221,6 +231,8 @@ class Router:
                     reply_id if index == 0 else None,
                     f"attachment:{index}",
                 )
+                if fallback_ids:
+                    self._db.store_delivery_part(job.id, part_key, str(fallback_ids[0]))
                 sent_ids.extend(fallback_ids)
 
         if remaining_text:
@@ -243,6 +255,193 @@ class Router:
             event.message_id,
             sent_ids[0],
             "outbound" if event.direction == "outbound_native" else "inbound",
+        )
+        self._store_external_snapshot(conversation.id, event)
+
+    async def _process_inbound_edit(
+        self,
+        job: DeliveryJob,
+        event: InboundEditEvent,
+    ) -> None:
+        conversation = self._db.get_conversation(event.platform, event.conversation_id)
+        if conversation is None:
+            return
+        old_message_id = self._db.telegram_message_for_external(
+            conversation.id,
+            event.message_id,
+        )
+        if old_message_id is None:
+            return
+        relay = self._outbox_telegram if event.direction == "outbound_native" else self._telegram
+        original = self._external_snapshot(conversation.id, event.message_id)
+        known_delivery_ids = set(
+            self._db.telegram_delivery_ids_for_external_message(
+                event.platform,
+                event.message_id,
+            )
+        )
+        if not known_delivery_ids:
+            known_delivery_ids.add(old_message_id)
+        media_unchanged = original is not None and original.attachments == event.attachments
+        can_edit_in_place = (
+            len(known_delivery_ids) == 1
+            and media_unchanged
+            and (
+                (not event.attachments and event.text is not None)
+                or (
+                    bool(event.attachments)
+                    and (event.text is None or utf16_length(event.text) <= 1024)
+                )
+            )
+        )
+        part_key = "edit:in-place"
+        if can_edit_in_place and self._db.get_delivery_part(job.id, part_key) is None:
+            try:
+                if event.attachments:
+                    await relay.edit_caption(self._chat_id, old_message_id, event.text)
+                else:
+                    await relay.edit_text(self._chat_id, old_message_id, cast(str, event.text))
+            except TelegramError as exc:
+                if exc.retryable:
+                    raise
+            else:
+                self._db.store_delivery_part(job.id, part_key, str(old_message_id))
+                self._store_external_snapshot(conversation.id, event)
+                return
+        elif can_edit_in_place:
+            self._store_external_snapshot(conversation.id, event)
+            return
+
+        sent_ids = await self._send_inbound_replacement(job, relay, conversation, event)
+        if not sent_ids:
+            raise PermanentDeliveryError("Discord edit produced no Telegram messages")
+        old_ids = {old_message_id, *known_delivery_ids}
+        for message_id in sorted(old_ids):
+            if message_id in sent_ids:
+                continue
+            delete_key = f"edit:delete:{message_id}"
+            if self._db.get_delivery_part(job.id, delete_key) is not None:
+                continue
+            try:
+                await relay.delete_message(self._chat_id, message_id)
+            except TelegramError as exc:
+                if exc.retryable:
+                    raise
+                _LOGGER.warning(
+                    "Unable to delete obsolete Telegram message %s for Discord edit %s: %s",
+                    message_id,
+                    event.event_id,
+                    exc,
+                )
+            self._db.store_delivery_part(job.id, delete_key, str(message_id))
+        self._db.store_message_copy(
+            conversation.id,
+            event.message_id,
+            sent_ids[0],
+            "outbound" if event.direction == "outbound_native" else "inbound",
+        )
+        self._store_external_snapshot(conversation.id, event)
+
+    async def _send_inbound_replacement(
+        self,
+        job: DeliveryJob,
+        relay: TelegramClient,
+        conversation: Conversation,
+        event: InboundEditEvent,
+    ) -> list[int]:
+        sent_ids: list[int] = []
+        caption = (
+            event.text
+            if event.attachments and event.text is not None and utf16_length(event.text) <= 1024
+            else None
+        )
+        remaining_text = None if caption is not None else event.text
+        for index, attachment in enumerate(event.attachments):
+            part_key = f"edit:attachment:{index}"
+            existing = self._db.get_delivery_part(job.id, part_key)
+            if existing is not None:
+                sent_ids.append(int(existing))
+                continue
+            try:
+                content = await download_media(
+                    self._session,
+                    event.platform,
+                    attachment.url,
+                    self._max_image_bytes,
+                )
+                send_media = (
+                    relay.send_animation
+                    if attachment.mime_type in ("image/gif", "video/mp4")
+                    else relay.send_photo
+                )
+                message_id = await send_media(
+                    self._chat_id,
+                    conversation.telegram_topic_id,
+                    content,
+                    attachment.filename,
+                    attachment.mime_type,
+                    caption=caption if index == 0 else None,
+                )
+                self._db.store_delivery_part(job.id, part_key, str(message_id))
+                sent_ids.append(message_id)
+            except MediaDownloadError as exc:
+                _LOGGER.warning(
+                    "Unable to relay edited Discord media for event %s: %s",
+                    event.event_id,
+                    exc,
+                )
+                fallback = attachment.url
+                if index == 0 and caption:
+                    fallback = f"{caption}\n{attachment.url}"
+                fallback_ids = await self._send_complete_text(
+                    job,
+                    relay,
+                    conversation.telegram_topic_id,
+                    fallback,
+                    None,
+                    f"edit:attachment:{index}",
+                )
+                if fallback_ids:
+                    self._db.store_delivery_part(job.id, part_key, str(fallback_ids[0]))
+                sent_ids.extend(fallback_ids)
+        if remaining_text:
+            sent_ids.extend(
+                await self._send_complete_text(
+                    job,
+                    relay,
+                    conversation.telegram_topic_id,
+                    remaining_text,
+                    None,
+                    "edit:text",
+                )
+            )
+        return sent_ids
+
+    def _external_snapshot(
+        self,
+        conversation_id: int,
+        message_id: str,
+    ) -> InboundEvent | None:
+        raw = self._db.get_external_message_snapshot(conversation_id, message_id)
+        if raw is None:
+            return None
+        try:
+            payload: object = json.loads(raw)
+            if not isinstance(payload, dict):
+                return None
+            return InboundEvent.from_mapping(cast(dict[str, object], payload))
+        except (json.JSONDecodeError, ValueError):
+            return None
+
+    def _store_external_snapshot(
+        self,
+        conversation_id: int,
+        event: InboundEvent,
+    ) -> None:
+        self._db.store_external_message_snapshot(
+            conversation_id,
+            event.message_id,
+            json.dumps(event.to_mapping(), ensure_ascii=False, separators=(",", ":")),
         )
 
     async def _process_presence(self, job: DeliveryJob, event: PresenceEvent) -> None:
@@ -402,6 +601,7 @@ class Router:
                 telegram_message_id,
                 "outbound",
             )
+            self._db.store_telegram_external_parts(telegram_message_id, delivered_ids)
 
     async def _process_telegram_edit(
         self,
@@ -419,31 +619,71 @@ class Router:
         )
         text_value = message.get("text") or message.get("caption")
         text = text_value if isinstance(text_value, str) and text_value else None
-        if (
-            conversation.platform == "discord"
-            and external_message_id is not None
-            and (text is None or utf16_length(text) <= 2000)
-        ):
-            part_key = "external-edit"
-            if self._db.get_delivery_part(job.id, part_key) is not None:
-                return
-            delivery = await self._adapters.edit(
-                conversation.platform,
-                conversation.external_chat_id,
-                external_message_id,
-                text,
-            )
-            self._db.store_delivery_part(job.id, part_key, delivery.message_id)
+        update_id = update.get("update_id")
+        if not isinstance(update_id, int):
+            raise PermanentDeliveryError("Telegram edit has no integer update_id")
+        if conversation.platform == "discord" and external_message_id is not None:
+            external_ids = self._db.telegram_external_parts(telegram_message_id)
+            if not external_ids:
+                external_ids = self._db.external_delivery_ids_for_telegram_message(
+                    telegram_message_id
+                )
+            if not external_ids:
+                external_ids = [external_message_id]
+            chunks: list[str | None]
+            if text is None:
+                chunks = [None]
+            else:
+                chunks = [chunk for chunk in split_utf16(text, 2000)]
+            current_ids: list[str] = []
+            for index, existing_id in enumerate(external_ids):
+                if index < len(chunks):
+                    part_key = f"external-edit:update:{index}"
+                    if self._db.get_delivery_part(job.id, part_key) is None:
+                        delivery = await self._adapters.edit(
+                            conversation.platform,
+                            conversation.external_chat_id,
+                            existing_id,
+                            chunks[index],
+                        )
+                        self._db.store_delivery_part(job.id, part_key, delivery.message_id)
+                    current_ids.append(existing_id)
+                else:
+                    part_key = f"external-edit:delete:{index}"
+                    if self._db.get_delivery_part(job.id, part_key) is None:
+                        await self._adapters.delete(
+                            conversation.platform,
+                            conversation.external_chat_id,
+                            existing_id,
+                        )
+                        self._db.store_delivery_part(job.id, part_key, existing_id)
+            for index in range(len(external_ids), len(chunks)):
+                part_key = f"external-edit:new:{index}"
+                existing = self._db.get_delivery_part(job.id, part_key)
+                if existing is not None:
+                    current_ids.append(existing)
+                    continue
+                delivery = await self._adapters.send(
+                    conversation.platform,
+                    OutboundMessage(
+                        idempotency_key=f"telegram-edit:{update_id}:part:{index}",
+                        conversation_id=conversation.external_chat_id,
+                        text=chunks[index],
+                        reply_to_message_id=None,
+                        image=None,
+                        image_filename=None,
+                        image_mime_type=None,
+                    ),
+                )
+                self._db.store_delivery_part(job.id, part_key, delivery.message_id)
+                current_ids.append(delivery.message_id)
+            self._db.store_telegram_external_parts(telegram_message_id, current_ids)
             return
 
         if text is None:
             return
-        update_id = update.get("update_id")
-        if not isinstance(update_id, int):
-            raise PermanentDeliveryError("Telegram edit has no integer update_id")
-        limit = 2000 if conversation.platform == "discord" else 4096
-        chunks = split_utf16(f"✏️ {text}", limit)
-        for index, chunk in enumerate(chunks):
+        correction_chunks = split_utf16(f"✏️ {text}", 4096)
+        for index, chunk in enumerate(correction_chunks):
             part_key = f"external-edit:{index}"
             if self._db.get_delivery_part(job.id, part_key) is not None:
                 continue

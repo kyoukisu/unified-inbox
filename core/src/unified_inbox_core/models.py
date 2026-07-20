@@ -124,6 +124,20 @@ class InboundEvent:
         }
 
 
+class InboundEditEvent(InboundEvent):
+    @classmethod
+    def from_mapping(cls, data: Mapping[str, object]) -> InboundEditEvent:
+        event = super().from_mapping(data)
+        if event.platform != "discord":
+            raise ValueError("message edits are only supported for Discord")
+        return cast(InboundEditEvent, event)
+
+    def to_mapping(self) -> dict[str, object]:
+        mapping = super().to_mapping()
+        mapping["kind"] = "message_edit"
+        return mapping
+
+
 @dataclass(frozen=True, slots=True)
 class PresenceEvent:
     platform: Platform
@@ -159,16 +173,18 @@ class PresenceEvent:
         }
 
 
-ExternalEvent = InboundEvent | PresenceEvent
+ExternalEvent = InboundEvent | InboundEditEvent | PresenceEvent
 
 
 def external_event_from_mapping(data: Mapping[str, object]) -> ExternalEvent:
     kind = data.get("kind", "message")
     if kind == "message":
         return InboundEvent.from_mapping(data)
+    if kind == "message_edit":
+        return InboundEditEvent.from_mapping(data)
     if kind == "presence":
         return PresenceEvent.from_mapping(data)
-    raise ValueError("kind must be message or presence")
+    raise ValueError("kind must be message, message_edit, or presence")
 
 
 @dataclass(frozen=True, slots=True)

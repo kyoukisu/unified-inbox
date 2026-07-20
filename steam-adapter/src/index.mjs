@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 
 import SteamUser from "steam-user";
@@ -197,6 +197,23 @@ async function reconcileRecentFriendMessages() {
       } catch (error) {
         failedConversations.add(conversationId);
         log("WARN", `Unable to reconcile Steam history for ${conversationId}`, error);
+      }
+    }
+    for (const { idempotencyKey, record } of deliveries.ambiguousRecords()) {
+      if (!record.conversationId || failedConversations.has(record.conversationId)) continue;
+      try {
+        await reconcileAmbiguousOutbound(
+          idempotencyKey,
+          record.conversationId,
+          record,
+        );
+      } catch (error) {
+        failedConversations.add(record.conversationId);
+        log(
+          "WARN",
+          `Unable to reconcile ambiguous Steam delivery ${idempotencyKey}`,
+          error,
+        );
       }
     }
   } catch (error) {
@@ -437,6 +454,58 @@ async function withOutboundLock(key, operation) {
   }
 }
 
+async function reconcileAmbiguousOutbound(idempotencyKey, conversationId, record) {
+  const startedAt = [record.textStartedAt, record.imageStartedAt]
+    .filter((value) => Number.isFinite(value));
+  if (startedAt.length === 0) return record;
+  const history = await collectHistoryPages(
+    (options) => client.chat.getFriendMessageHistory(conversationId, options),
+    {
+      maxCount: 100,
+      startTime: new Date(Math.min(...startedAt) - 5000),
+      wantBbcode: true,
+    },
+  );
+  const ownMessages = history.filter(
+    (message) => message.sender?.toString() === accountId,
+  );
+  const patch = {};
+  if (record.textStartedAt && record.text && !record.textMessageId) {
+    const textMessage = ownMessages.find(
+      (message) =>
+        message.server_timestamp.getTime() >= record.textStartedAt - 5000
+        && parseFriendMessage(message).text === record.text,
+    );
+    if (textMessage) patch.textMessageId = messageIdentity(textMessage);
+  }
+  if (record.imageStartedAt && record.imageSha && !record.imageUrl) {
+    for (const message of ownMessages) {
+      if (message.server_timestamp.getTime() < record.imageStartedAt - 5000) continue;
+      const { attachments } = parseFriendMessage(message);
+      for (const attachment of attachments) {
+        const response = await fetch(attachment.url, {
+          signal: AbortSignal.timeout(30_000),
+        });
+        if (!response.ok) {
+          throw new Error(`Steam image reconciliation returned HTTP ${response.status}`);
+        }
+        const content = Buffer.from(await response.arrayBuffer());
+        const sha = createHash("sha256").update(content).digest("hex");
+        if (sha === record.imageSha) {
+          patch.imageUrl = attachment.url;
+          break;
+        }
+      }
+      if (patch.imageUrl) break;
+    }
+  }
+  if (Object.keys(patch).length > 0) {
+    await deliveries.update(idempotencyKey, patch);
+    return deliveries.getRecord(idempotencyKey);
+  }
+  return record;
+}
+
 async function sendOutbound(metadata, image) {
   return withOutboundLock(metadata.conversation_id, async () => {
     const cached = deliveries.get(metadata.idempotency_key);
@@ -450,10 +519,39 @@ async function sendOutbound(metadata, image) {
         imageUrl: null,
         textMessageId: null,
         messageId: null,
+        textStartedAt: null,
+        text: null,
+        imageStartedAt: null,
+        imageSha: null,
         completed: false,
       };
+      const hasAmbiguousIntent = (
+        image && record.imageStartedAt && !record.imageUrl
+      ) || (
+        metadata.text && record.textStartedAt && !record.textMessageId
+      );
+      if (hasAmbiguousIntent) {
+        record = await reconcileAmbiguousOutbound(
+          metadata.idempotency_key,
+          metadata.conversation_id,
+          record,
+        );
+      }
 
       if (image && !record.imageUrl) {
+        const imageSha = createHash("sha256").update(image).digest("hex");
+        if (record.imageSha && record.imageSha !== imageSha) {
+          throw new Error("Steam idempotency key was reused with different image content");
+        }
+        if (record.imageStartedAt && Date.now() - record.imageStartedAt < 30_000) {
+          throw new Error("Steam image delivery is awaiting history reconciliation");
+        }
+        const imageStartedAt = Date.now();
+        await deliveries.update(metadata.idempotency_key, {
+          conversationId: metadata.conversation_id,
+          imageStartedAt,
+          imageSha,
+        });
         const imageUrl = await imageUploader.sendImageToUser(metadata.conversation_id, image);
         rememberBridgeValue(bridgeImageUrls, imageUrl);
         await deliveries.update(metadata.idempotency_key, {
@@ -464,6 +562,18 @@ async function sendOutbound(metadata, image) {
       }
 
       if (metadata.text && !record.textMessageId) {
+        if (record.text && record.text !== metadata.text) {
+          throw new Error("Steam idempotency key was reused with different text");
+        }
+        if (record.textStartedAt && Date.now() - record.textStartedAt < 30_000) {
+          throw new Error("Steam text delivery is awaiting history reconciliation");
+        }
+        const textStartedAt = Date.now();
+        await deliveries.update(metadata.idempotency_key, {
+          conversationId: metadata.conversation_id,
+          textStartedAt,
+          text: metadata.text,
+        });
         const sent = await client.chat.sendFriendMessage(metadata.conversation_id, metadata.text, {
           containsBbCode: false,
         });

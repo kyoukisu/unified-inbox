@@ -11,6 +11,7 @@ from unified_inbox_core.db import Database
 from unified_inbox_core.delivery import DeliveryWorker
 from unified_inbox_core.models import (
     DeliveryJob,
+    InboundEditEvent,
     InboundEvent,
     OutboundMessage,
     Platform,
@@ -35,6 +36,8 @@ class FakeTelegram:
         self.sent_photos: list[tuple[int, str | None]] = []
         self.sent_animations: list[tuple[int, str | None, str]] = []
         self.deleted_messages: list[int] = []
+        self.edited_text: list[tuple[int, str]] = []
+        self.edited_captions: list[tuple[int, str | None]] = []
         self.reactions: list[tuple[int, str]] = []
 
     async def create_topic(
@@ -65,6 +68,19 @@ class FakeTelegram:
     async def delete_message(self, chat_id: int, message_id: int) -> None:
         assert chat_id == -100123
         self.deleted_messages.append(message_id)
+
+    async def edit_text(self, chat_id: int, message_id: int, text: str) -> None:
+        assert chat_id == -100123
+        self.edited_text.append((message_id, text))
+
+    async def edit_caption(
+        self,
+        chat_id: int,
+        message_id: int,
+        caption: str | None,
+    ) -> None:
+        assert chat_id == -100123
+        self.edited_captions.append((message_id, caption))
 
     async def send_text(
         self,
@@ -155,6 +171,7 @@ class FakeAdapters:
     def __init__(self) -> None:
         self.sent: list[tuple[Platform, OutboundMessage]] = []
         self.edited: list[tuple[Platform, str, str, str | None]] = []
+        self.deleted: list[tuple[Platform, str, str]] = []
 
     async def send(self, platform: Platform, message: OutboundMessage) -> AdapterDelivery:
         self.sent.append((platform, message))
@@ -169,6 +186,14 @@ class FakeAdapters:
     ) -> AdapterDelivery:
         self.edited.append((platform, conversation_id, message_id, text))
         return AdapterDelivery(message_id=message_id)
+
+    async def delete(
+        self,
+        platform: Platform,
+        conversation_id: str,
+        message_id: str,
+    ) -> None:
+        self.deleted.append((platform, conversation_id, message_id))
 
     async def status(self, platform: Platform) -> dict[str, object]:
         return {"ok": True, "platform": platform}
@@ -299,6 +324,100 @@ async def test_backfilled_message_with_existing_copy_is_not_duplicated(tmp_path:
         await process_next(db, router)
 
     assert telegram.sent_text == [(77, "hello")]
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_discord_text_edit_updates_existing_telegram_message(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bridge.sqlite3")
+    telegram = FakeTelegram()
+    adapters = FakeAdapters()
+    async with aiohttp.ClientSession() as session:
+        router = Router(
+            db,
+            cast(TelegramClient, telegram),
+            cast(AdapterClient, adapters),
+            session,
+            -100123,
+            999,
+            1024,
+        )
+        original = inbound_event(platform="discord", text="hello")
+        router.enqueue_inbound(original)
+        await process_next(db, router)
+        edit = InboundEditEvent.from_mapping(
+            {
+                **original.to_mapping(),
+                "kind": "message_edit",
+                "event_id": "edit:1700000000:corrected",
+                "text": "corrected",
+            }
+        )
+        router.enqueue_inbound(edit)
+        await process_next(db, router)
+
+    assert telegram.sent_text == [(77, "hello")]
+    assert telegram.edited_text == [(501, "corrected")]
+    assert telegram.deleted_messages == []
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_delayed_discord_embed_replaces_original_telegram_text(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_download_media(
+        session: aiohttp.ClientSession,
+        platform: str,
+        url: str,
+        max_bytes: int,
+    ) -> bytes:
+        del session, max_bytes
+        assert platform == "discord"
+        assert url == "https://media.discordapp.net/cat.png"
+        return b"image"
+
+    monkeypatch.setattr("unified_inbox_core.router.download_media", fake_download_media)
+    db = Database(tmp_path / "bridge.sqlite3")
+    telegram = FakeTelegram()
+    adapters = FakeAdapters()
+    async with aiohttp.ClientSession() as session:
+        router = Router(
+            db,
+            cast(TelegramClient, telegram),
+            cast(AdapterClient, adapters),
+            session,
+            -100123,
+            999,
+            1024,
+        )
+        original = inbound_event(platform="discord", text="https://example.com/cat")
+        router.enqueue_inbound(original)
+        await process_next(db, router)
+        edit = InboundEditEvent.from_mapping(
+            {
+                **original.to_mapping(),
+                "kind": "message_edit",
+                "event_id": "edit:1700000000:embed",
+                "text": None,
+                "attachments": [
+                    {
+                        "url": "https://media.discordapp.net/cat.png",
+                        "filename": "cat.png",
+                        "mime_type": "image/png",
+                    }
+                ],
+            }
+        )
+        router.enqueue_inbound(edit)
+        await process_next(db, router)
+
+    conversation = db.get_conversation("discord", "steam-alice")
+    assert conversation is not None
+    assert telegram.sent_photos == [(77, None)]
+    assert telegram.deleted_messages == [501]
+    assert db.telegram_message_for_external(conversation.id, "1700000000:0") == 502
     db.close()
 
 
@@ -489,7 +608,7 @@ async def test_telegram_edit_updates_existing_discord_message(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
-async def test_long_telegram_edit_is_sent_as_bounded_correction_parts(
+async def test_long_telegram_edit_updates_and_extends_discord_parts(
     tmp_path: Path,
 ) -> None:
     db = Database(tmp_path / "bridge.sqlite3")
@@ -523,11 +642,53 @@ async def test_long_telegram_edit_is_sent_as_bounded_correction_parts(
         await process_next(db, router)
 
     messages = [outbound for _, outbound in adapters.sent]
-    assert len(messages) == 2
-    assert "".join(message.text or "" for message in messages) == f"✏️ {text}"
-    assert all(utf16_length(message.text or "") <= 2000 for message in messages)
-    assert messages[0].reply_to_message_id == "discord-message-55"
-    assert messages[1].reply_to_message_id is None
+    assert len(adapters.edited) == 1
+    edited_text = adapters.edited[0][3]
+    assert edited_text is not None
+    assert len(messages) == 1
+    assert edited_text + (messages[0].text or "") == text
+    assert utf16_length(edited_text) <= 2000
+    assert utf16_length(messages[0].text or "") <= 2000
+    assert messages[0].reply_to_message_id is None
+    assert db.telegram_external_parts(91) == ["discord-message-55", "external-out-1"]
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_shortened_telegram_edit_removes_stale_discord_parts(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bridge.sqlite3")
+    conversation = db.create_conversation("discord", "dm-123", "Bob", 77)
+    db.store_message_copy(conversation.id, "discord-message-1", 91, "outbound")
+    db.store_telegram_external_parts(91, ["discord-message-1", "discord-message-2"])
+    telegram = FakeTelegram()
+    adapters = FakeAdapters()
+    async with aiohttp.ClientSession() as session:
+        router = Router(
+            db,
+            cast(TelegramClient, telegram),
+            cast(AdapterClient, adapters),
+            session,
+            -100123,
+            999,
+            1024,
+        )
+        router.enqueue_telegram_update(
+            {
+                "update_id": 406,
+                "edited_message": {
+                    "message_id": 91,
+                    "message_thread_id": 77,
+                    "chat": {"id": -100123},
+                    "from": {"id": 999},
+                    "text": "short",
+                },
+            }
+        )
+        await process_next(db, router)
+
+    assert adapters.edited == [("discord", "dm-123", "discord-message-1", "short")]
+    assert adapters.deleted == [("discord", "dm-123", "discord-message-2")]
+    assert db.telegram_external_parts(91) == ["discord-message-1"]
     db.close()
 
 

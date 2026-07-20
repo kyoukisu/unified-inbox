@@ -13,6 +13,7 @@ from discord_adapter.client import (
     CoreDeliveryError,
     DiscordBridgeClient,
     discord_direct_image_attachment,
+    discord_edit_event_id,
     discord_embed_attachments,
     discord_history_newer_than,
     discord_messages_oldest_first,
@@ -56,6 +57,22 @@ async def test_waits_for_discord_to_generate_tenor_embed() -> None:
     assert channel.calls == 1
     assert is_tenor_view_url("https://tenor.com/view/cat-gif-123")
     assert not is_tenor_view_url("look https://tenor.com/view/cat-gif-123")
+
+
+def test_discord_edit_event_id_is_stable_and_content_sensitive() -> None:
+    attachments = [
+        {
+            "url": "https://media.discordapp.net/cat.png",
+            "filename": "cat.png",
+            "mime_type": "image/png",
+        }
+    ]
+
+    first = discord_edit_event_id(100, "caption", attachments)
+
+    assert first == discord_edit_event_id(100, "caption", attachments)
+    assert first != discord_edit_event_id(100, "corrected", attachments)
+    assert first.startswith("edit:100:")
 
 
 def test_discord_messages_are_deduplicated_and_sorted_oldest_first() -> None:

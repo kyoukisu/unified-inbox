@@ -18,7 +18,7 @@ test("delivery store persists idempotency mappings", async () => {
 
     const second = new DeliveryStore(path, 2);
     await second.load();
-    assert.equal(second.get("one"), undefined);
+    assert.equal(second.get("one"), "message-1");
     assert.equal(second.get("two"), "message-2");
     assert.equal(second.get("three"), "message-3");
 
@@ -26,16 +26,32 @@ test("delivery store persists idempotency mappings", async () => {
       conversationId: "steam-alice",
       imageUrl: "https://steam.example/image",
       textMessageId: "1700000000:1",
+      textStartedAt: 1234,
+      text: "hello",
+      imageStartedAt: 1235,
+      imageSha: "abc123",
+    });
+    await second.update("ambiguous", {
+      conversationId: "steam-alice",
+      textStartedAt: 2000,
+      text: "pending",
     });
     const third = new DeliveryStore(path, 3);
     await third.load();
-    assert.deepEqual(third.getRecord("partial"), {
-      conversationId: "steam-alice",
-      imageUrl: "https://steam.example/image",
-      textMessageId: "1700000000:1",
-      messageId: null,
-      completed: false,
-    });
+    const partial = third.getRecord("partial");
+    assert.equal(partial.conversationId, "steam-alice");
+    assert.equal(partial.imageUrl, "https://steam.example/image");
+    assert.equal(partial.textMessageId, "1700000000:1");
+    assert.equal(partial.textStartedAt, 1234);
+    assert.equal(partial.text, "hello");
+    assert.equal(partial.imageStartedAt, 1235);
+    assert.equal(partial.imageSha, "abc123");
+    assert.equal(partial.messageId, null);
+    assert.equal(partial.completed, false);
+    assert.ok(partial.updatedAt > 0);
+    assert.deepEqual(third.ambiguousRecords().map((item) => item.idempotencyKey), [
+      "ambiguous",
+    ]);
     assert.equal(third.hasMessageId("steam-alice", "1700000000:1"), true);
     assert.equal(third.hasMessageId("steam-bob", "1700000000:1"), false);
     assert.equal(third.hasMessageId("steam-alice", "missing"), false);

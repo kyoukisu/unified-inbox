@@ -23,6 +23,7 @@ class OutboundRecord:
     nonce: int
     state: str
     message_id: str | None
+    created_at: float
 
 
 class AdapterStore:
@@ -238,7 +239,7 @@ class AdapterStore:
     def get_outbound(self, idempotency_key: str) -> OutboundRecord | None:
         row = self._connection.execute(
             """
-            SELECT idempotency_key, conversation_id, nonce, state, message_id
+            SELECT idempotency_key, conversation_id, nonce, state, message_id, created_at
             FROM outbound_deliveries
             WHERE idempotency_key = ?
             """,
@@ -252,6 +253,7 @@ class AdapterStore:
             nonce=int(row["nonce"]),
             state=str(row["state"]),
             message_id=str(row["message_id"]) if row["message_id"] is not None else None,
+            created_at=float(row["created_at"]),
         )
 
     def complete_outbound(self, idempotency_key: str, message_id: str) -> None:
@@ -268,14 +270,9 @@ class AdapterStore:
             self._connection.execute(
                 """
                 DELETE FROM outbound_deliveries
-                WHERE state = 'completed' AND idempotency_key IN (
-                    SELECT idempotency_key
-                    FROM outbound_deliveries
-                    WHERE state = 'completed'
-                    ORDER BY updated_at DESC
-                    LIMIT -1 OFFSET 5000
-                )
-                """
+                WHERE state = 'completed' AND updated_at < ?
+                """,
+                (now - 16 * 24 * 60 * 60,),
             )
 
     def is_bridge_nonce(self, nonce: int) -> bool:

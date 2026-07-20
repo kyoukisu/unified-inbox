@@ -53,3 +53,30 @@ async def test_adapter_sends_multipart_metadata_as_text() -> None:
 
     assert delivery.message_id == "external-1"
     assert received["idempotency_key"] == "telegram:1"
+
+
+@pytest.mark.asyncio
+async def test_adapter_deletes_external_message() -> None:
+    received: dict[str, object] = {}
+
+    async def delete(request: web.Request) -> web.Response:
+        received.update(cast(dict[str, object], await request.json()))
+        received["message_id"] = request.match_info["message_id"]
+        return web.json_response({"ok": True})
+
+    application = web.Application()
+    application.router.add_delete("/v1/messages/{message_id}", delete)
+    server = TestServer(application)
+    await server.start_server()
+    try:
+        async with aiohttp.ClientSession() as session:
+            client = AdapterClient(
+                session,
+                "internal-token",
+                {"discord": str(server.make_url("/")).rstrip("/")},
+            )
+            await client.delete("discord", "dm-1", "external-1")
+    finally:
+        await server.close()
+
+    assert received == {"conversation_id": "dm-1", "message_id": "external-1"}

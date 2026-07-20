@@ -124,6 +124,48 @@ async def test_retry_after_is_preserved() -> None:
 
 
 @pytest.mark.asyncio
+async def test_message_not_modified_is_idempotent_success() -> None:
+    client = InspectableTelegramClient(cast(aiohttp.ClientSession, object()), "token", 1024)
+    response = cast(
+        aiohttp.ClientResponse,
+        FakeResponse(
+            {
+                "ok": False,
+                "error_code": 400,
+                "description": "Bad Request: message is not modified",
+            },
+            status=400,
+        ),
+    )
+
+    assert await client.parse_response(response, "editMessageText") is True
+
+
+@pytest.mark.asyncio
+async def test_edit_text_and_caption_use_telegram_edit_methods() -> None:
+    client = CapturingTelegramClient()
+
+    await client.edit_text(-100123, 41, "corrected")
+    await client.edit_caption(-100123, 42, "caption")
+
+    assert client.calls == [
+        (
+            "editMessageText",
+            {
+                "chat_id": -100123,
+                "message_id": 41,
+                "text": "corrected",
+                "disable_web_page_preview": True,
+            },
+        ),
+        (
+            "editMessageCaption",
+            {"chat_id": -100123, "message_id": 42, "caption": "caption"},
+        ),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_get_updates_requests_message_edits() -> None:
     client = CapturingGetUpdatesClient()
 

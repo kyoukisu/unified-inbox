@@ -137,6 +137,36 @@ class TelegramClient:
             {"chat_id": chat_id, "message_id": message_id},
         )
 
+    async def edit_text(self, chat_id: int, message_id: int, text: str) -> None:
+        if not text or utf16_length(text) > 4096:
+            raise ValueError("Telegram text must contain 1-4096 UTF-16 units")
+        await self.call(
+            "editMessageText",
+            {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "text": text,
+                "disable_web_page_preview": True,
+            },
+        )
+
+    async def edit_caption(
+        self,
+        chat_id: int,
+        message_id: int,
+        caption: str | None,
+    ) -> None:
+        if caption is not None and utf16_length(caption) > 1024:
+            raise ValueError("Telegram caption exceeds 1024 UTF-16 units")
+        await self.call(
+            "editMessageCaption",
+            {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "caption": caption or "",
+            },
+        )
+
     async def send_text(
         self,
         chat_id: int,
@@ -360,12 +390,14 @@ class TelegramClient:
         raw = cast(dict[str, object], raw_object)
         if raw.get("ok") is not True:
             description = raw.get("description")
-            if (
-                method == "editForumTopic"
-                and isinstance(description, str)
-                and "TOPIC_NOT_MODIFIED" in description
-            ):
-                return True
+            if isinstance(description, str):
+                if method == "editForumTopic" and "TOPIC_NOT_MODIFIED" in description:
+                    return True
+                if method in ("editMessageText", "editMessageCaption") and (
+                    "message is not modified" in description.lower()
+                    or "MESSAGE_NOT_MODIFIED" in description
+                ):
+                    return True
             error_code = raw.get("error_code")
             status = error_code if isinstance(error_code, int) else response.status
             retry_after: float | None = None

@@ -7,6 +7,7 @@ import logging
 from typing import cast
 
 import aiohttp
+import discord
 from aiohttp import web
 from aiohttp.web_request import FileField
 
@@ -62,6 +63,7 @@ class DiscordAdapterApplication:
         app.router.add_get("/health", self.health)
         app.router.add_post("/v1/messages", self.send_message)
         app.router.add_patch("/v1/messages/{message_id}", self.edit_message)
+        app.router.add_delete("/v1/messages/{message_id}", self.delete_message)
         return app
 
     async def health(self, request: web.Request) -> web.Response:
@@ -108,6 +110,8 @@ class DiscordAdapterApplication:
             )
         except (ValueError, json.JSONDecodeError) as exc:
             return web.json_response({"ok": False, "error": str(exc)}, status=400)
+        except discord.HTTPException as exc:
+            return self._discord_error_response(exc, "Discord outbound delivery failed")
         except Exception as exc:
             _LOGGER.exception("Discord outbound delivery failed")
             return web.json_response({"ok": False, "error": str(exc)}, status=502)
@@ -135,10 +139,61 @@ class DiscordAdapterApplication:
             )
         except (ValueError, json.JSONDecodeError) as exc:
             return web.json_response({"ok": False, "error": str(exc)}, status=400)
+        except discord.HTTPException as exc:
+            return self._discord_error_response(exc, "Discord message edit failed")
         except Exception as exc:
             _LOGGER.exception("Discord message edit failed")
             return web.json_response({"ok": False, "error": str(exc)}, status=502)
         return web.json_response({"ok": True, "message_id": edited_message_id})
+
+    async def delete_message(self, request: web.Request) -> web.Response:
+        if not self._authorized(request):
+            return web.json_response(
+                {"ok": False, "error": "invalid internal token"},
+                status=401,
+            )
+        try:
+            raw_object: object = await request.json()
+            if not isinstance(raw_object, dict):
+                raise ValueError("request body must be an object")
+            payload = cast(dict[str, object], raw_object)
+            message_id = self._required_string(
+                {"message_id": request.match_info.get("message_id")},
+                "message_id",
+            )
+            await self._client.delete_message(
+                conversation_id=self._required_string(payload, "conversation_id"),
+                message_id=message_id,
+            )
+        except (ValueError, json.JSONDecodeError) as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=400)
+        except discord.HTTPException as exc:
+            if isinstance(exc, discord.NotFound):
+                return web.json_response({"ok": True})
+            return self._discord_error_response(exc, "Discord message deletion failed")
+        except Exception as exc:
+            _LOGGER.exception("Discord message deletion failed")
+            return web.json_response({"ok": False, "error": str(exc)}, status=502)
+        return web.json_response({"ok": True})
+
+    @staticmethod
+    def _discord_error_response(
+        exc: discord.HTTPException,
+        log_message: str,
+    ) -> web.Response:
+        _LOGGER.exception(log_message)
+        if exc.status == 429:
+            retry_after = getattr(exc, "retry_after", None)
+            payload: dict[str, object] = {"ok": False, "error": str(exc)}
+            if isinstance(retry_after, int | float):
+                payload["retry_after"] = retry_after
+            return web.json_response(payload, status=429)
+        if 400 <= exc.status < 500:
+            return web.json_response(
+                {"ok": False, "error": str(exc)},
+                status=exc.status,
+            )
+        return web.json_response({"ok": False, "error": str(exc)}, status=502)
 
     async def _parse_request(
         self,

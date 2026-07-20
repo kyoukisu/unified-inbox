@@ -1,7 +1,11 @@
 import pytest
 
 from unified_inbox_core.media import is_allowed_media_url
-from unified_inbox_core.models import PresenceEvent, external_event_from_mapping
+from unified_inbox_core.models import (
+    InboundEditEvent,
+    PresenceEvent,
+    external_event_from_mapping,
+)
 
 
 def test_presence_event_is_parsed_without_message_content() -> None:
@@ -32,6 +36,26 @@ def test_presence_event_rejects_unknown_status(status: str) -> None:
                 "status": status,
             }
         )
+
+
+def test_discord_message_edit_is_parsed() -> None:
+    event = external_event_from_mapping(
+        {
+            "kind": "message_edit",
+            "platform": "discord",
+            "event_id": "edit:message-1:revision",
+            "conversation_id": "dm-1",
+            "display_name": "Alice",
+            "sender_id": "alice",
+            "sender_name": "Alice",
+            "message_id": "message-1",
+            "text": "corrected",
+            "attachments": [],
+        }
+    )
+
+    assert isinstance(event, InboundEditEvent)
+    assert event.to_mapping()["kind"] == "message_edit"
 
 
 def test_inbound_event_requires_content() -> None:

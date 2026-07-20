@@ -54,6 +54,22 @@ CREATE TABLE IF NOT EXISTS message_copies (
     UNIQUE (conversation_id, telegram_message_id)
 );
 
+CREATE TABLE IF NOT EXISTS telegram_external_parts (
+    telegram_message_id INTEGER NOT NULL,
+    part_index INTEGER NOT NULL,
+    external_message_id TEXT NOT NULL,
+    PRIMARY KEY (telegram_message_id, part_index),
+    UNIQUE (telegram_message_id, external_message_id)
+);
+
+CREATE TABLE IF NOT EXISTS external_message_snapshots (
+    conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    external_message_id TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (conversation_id, external_message_id)
+);
+
 CREATE TABLE IF NOT EXISTS processed_events (
     source TEXT NOT NULL,
     event_id TEXT NOT NULL,
@@ -783,6 +799,123 @@ class Database:
             (conversation_id, telegram_message_id),
         ).fetchone()
         return str(row["external_message_id"]) if row is not None else None
+
+    def store_external_message_snapshot(
+        self,
+        conversation_id: int,
+        external_message_id: str,
+        payload_json: str,
+    ) -> None:
+        with self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO external_message_snapshots (
+                    conversation_id, external_message_id, payload_json, updated_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT (conversation_id, external_message_id) DO UPDATE SET
+                    payload_json = excluded.payload_json,
+                    updated_at = excluded.updated_at
+                """,
+                (conversation_id, external_message_id, payload_json, time.time()),
+            )
+
+    def get_external_message_snapshot(
+        self,
+        conversation_id: int,
+        external_message_id: str,
+    ) -> str | None:
+        row = self._connection.execute(
+            """
+            SELECT payload_json
+            FROM external_message_snapshots
+            WHERE conversation_id = ? AND external_message_id = ?
+            """,
+            (conversation_id, external_message_id),
+        ).fetchone()
+        return str(row["payload_json"]) if row is not None else None
+
+    def telegram_delivery_ids_for_external_message(
+        self,
+        source: Platform,
+        external_message_id: str,
+    ) -> list[int]:
+        rows = self._connection.execute(
+            """
+            SELECT p.destination_message_id
+            FROM ingress_events AS e
+            JOIN delivery_jobs AS j ON j.ingress_event_id = e.id
+            JOIN delivery_parts AS p ON p.job_id = j.id
+            WHERE e.source = ?
+              AND json_extract(e.payload_json, '$.message_id') = ?
+              AND (
+                  p.part_key LIKE 'attachment:%'
+                  OR p.part_key LIKE 'text:%'
+                  OR p.part_key LIKE 'edit:attachment:%'
+                  OR p.part_key LIKE 'edit:text:%'
+              )
+            ORDER BY p.created_at, p.part_key
+            """,
+            (source, external_message_id),
+        ).fetchall()
+        message_ids: list[int] = []
+        for row in rows:
+            try:
+                message_ids.append(int(row["destination_message_id"]))
+            except (TypeError, ValueError):
+                continue
+        return message_ids
+
+    def store_telegram_external_parts(
+        self,
+        telegram_message_id: int,
+        external_message_ids: list[str],
+    ) -> None:
+        with self._connection:
+            self._connection.execute(
+                "DELETE FROM telegram_external_parts WHERE telegram_message_id = ?",
+                (telegram_message_id,),
+            )
+            self._connection.executemany(
+                """
+                INSERT INTO telegram_external_parts (
+                    telegram_message_id, part_index, external_message_id
+                ) VALUES (?, ?, ?)
+                """,
+                [
+                    (telegram_message_id, index, external_message_id)
+                    for index, external_message_id in enumerate(external_message_ids)
+                ],
+            )
+
+    def telegram_external_parts(self, telegram_message_id: int) -> list[str]:
+        rows = self._connection.execute(
+            """
+            SELECT external_message_id
+            FROM telegram_external_parts
+            WHERE telegram_message_id = ?
+            ORDER BY part_index
+            """,
+            (telegram_message_id,),
+        ).fetchall()
+        return [str(row["external_message_id"]) for row in rows]
+
+    def external_delivery_ids_for_telegram_message(
+        self,
+        telegram_message_id: int,
+    ) -> list[str]:
+        rows = self._connection.execute(
+            """
+            SELECT p.destination_message_id
+            FROM ingress_events AS e
+            JOIN delivery_jobs AS j ON j.ingress_event_id = e.id
+            JOIN delivery_parts AS p ON p.job_id = j.id
+            WHERE e.source = 'telegram' AND e.telegram_message_id = ?
+              AND p.part_key LIKE 'external:%'
+            ORDER BY p.created_at, p.part_key
+            """,
+            (telegram_message_id,),
+        ).fetchall()
+        return [str(row["destination_message_id"]) for row in rows]
 
     def get_state_int(self, key: str, default: int) -> int:
         row = self._connection.execute(

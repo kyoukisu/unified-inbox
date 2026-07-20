@@ -45,12 +45,12 @@ let personaRefreshRunning = false;
 let reconnectWatchdog = null;
 let historySyncPending = true;
 let historySyncRunning = false;
-const messageOrderGate = new ConversationEventGate(({
-  message,
-  direction,
-  advanceCursor,
-}) => {
-  handleFriendMessage(message, direction, advanceCursor);
+const messageOrderGate = new ConversationEventGate((event) => {
+  if (historySyncPending || historySyncRunning) {
+    bufferedFriendMessages.push(event);
+    return;
+  }
+  handleFriendMessage(event.message, event.direction, event.advanceCursor);
 });
 
 function rememberBridgeValue(values, value) {
@@ -212,7 +212,9 @@ async function reconcileRecentFriendMessages() {
       releaseFriendMessage(
         event.message,
         event.direction,
-        !discoveryFailed && !failedConversations.has(conversationId),
+        event.advanceCursor !== false
+          && !discoveryFailed
+          && !failedConversations.has(conversationId),
       );
     }
     log("INFO", `Steam history reconciliation observed ${historyEvents.length} messages`);

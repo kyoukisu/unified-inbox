@@ -132,6 +132,23 @@ async def test_discord_history_uses_watermark_or_24_hour_bootstrap() -> None:
 
 
 @pytest.mark.asyncio
+async def test_discord_resume_restores_health_after_transient_disconnect(
+    tmp_path: Path,
+) -> None:
+    store = AdapterStore(tmp_path / "discord.sqlite3")
+    client = DiscordBridgeClient(
+        cast(aiohttp.ClientSession, object()),
+        "http://core.invalid",
+        "token",
+        store,
+    )
+    await client.on_resumed()
+
+    assert client.reconciliation_complete is True
+    store.close()
+
+
+@pytest.mark.asyncio
 async def test_core_http_400_is_quarantined_without_blocking_spool(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

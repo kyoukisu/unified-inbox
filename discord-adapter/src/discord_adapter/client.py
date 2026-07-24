@@ -344,6 +344,14 @@ class DiscordBridgeClient(discord.Client):
             self._reconciliation_retry_task.cancel()
             self._reconciliation_retry_task = None
 
+    async def on_resumed(self) -> None:
+        # discord.py dispatches RESUMED after a transient gateway reconnect,
+        # not READY. Keep health green when the session continuity was
+        # successfully restored; the gateway has replayed missed events.
+        self._reconciliation_active = False
+        self._reconciliation_complete = True
+        _LOGGER.info("Discord user session resumed")
+
     async def on_ready(self) -> None:
         if self.user is None:
             raise RuntimeError("Discord ready event has no current user")

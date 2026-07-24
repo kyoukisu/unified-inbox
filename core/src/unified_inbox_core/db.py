@@ -62,6 +62,11 @@ CREATE TABLE IF NOT EXISTS telegram_external_parts (
     UNIQUE (telegram_message_id, external_message_id)
 );
 
+CREATE TABLE IF NOT EXISTS superseded_presence_jobs (
+    job_id INTEGER PRIMARY KEY REFERENCES delivery_jobs(id) ON DELETE CASCADE,
+    superseded_by INTEGER NOT NULL REFERENCES delivery_jobs(id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS external_message_snapshots (
     conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
     external_message_id TEXT NOT NULL,
@@ -159,7 +164,11 @@ class Database:
                 "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (3, ?)",
                 (now,),
             )
-            self._connection.execute("PRAGMA user_version = 3")
+            self._connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (4, ?)",
+                (now,),
+            )
+            self._connection.execute("PRAGMA user_version = 4")
 
     def close(self) -> None:
         self._connection.close()
@@ -170,6 +179,7 @@ class Database:
         event_id: str,
         conversation_key: str,
         payload_json: str,
+        coalesce_presence: bool = False,
     ) -> EnqueueResult:
         return self._enqueue(
             source=source,
@@ -180,6 +190,7 @@ class Database:
             payload_json=payload_json,
             telegram_message_id=None,
             telegram_offset=None,
+            coalesce_presence=coalesce_presence,
         )
 
     def enqueue_telegram_update(
@@ -212,6 +223,7 @@ class Database:
         payload_json: str,
         telegram_message_id: int | None,
         telegram_offset: int | None,
+        coalesce_presence: bool = False,
     ) -> EnqueueResult:
         now = time.time()
         self._connection.execute("BEGIN IMMEDIATE")
@@ -286,6 +298,11 @@ class Database:
                         (source, event_id),
                     )
                     result = EnqueueResult(job_id=job_id, created=True, state="pending")
+                    if coalesce_presence:
+                        self._supersede_pending_presence(
+                            conversation_key,
+                            job_id,
+                        )
 
             if telegram_offset is not None:
                 self._connection.execute(
@@ -300,6 +317,31 @@ class Database:
         except Exception:
             self._connection.rollback()
             raise
+
+    def _supersede_pending_presence(
+        self,
+        conversation_key: str,
+        superseding_job_id: int,
+    ) -> None:
+        self._connection.execute(
+            """
+            INSERT INTO superseded_presence_jobs (job_id, superseded_by)
+            SELECT j.id, ?
+            FROM delivery_jobs AS j
+            JOIN ingress_events AS e ON e.id = j.ingress_event_id
+            WHERE j.conversation_key = ?
+              AND j.id < ?
+              AND j.state = 'pending'
+              AND e.source IN ('discord', 'steam')
+              AND json_extract(e.payload_json, '$.kind') = 'presence'
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM superseded_presence_jobs AS s
+                  WHERE s.job_id = j.id
+              )
+            """,
+            (superseding_job_id, conversation_key, superseding_job_id),
+        )
 
     def claim_next_job(self, lease_seconds: float, now: float | None = None) -> DeliveryJob | None:
         current = time.time() if now is None else now
@@ -322,10 +364,20 @@ class Database:
                   AND j.available_at <= ?
                   AND NOT EXISTS (
                       SELECT 1
+                      FROM superseded_presence_jobs AS s
+                      WHERE s.job_id = j.id
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
                       FROM delivery_jobs AS earlier
                       WHERE earlier.conversation_key = j.conversation_key
                         AND earlier.id < j.id
                         AND earlier.state IN ('pending', 'leased')
+                        AND NOT EXISTS (
+                            SELECT 1
+                            FROM superseded_presence_jobs AS s
+                            WHERE s.job_id = earlier.id
+                        )
                   )
                 ORDER BY j.id
                 LIMIT 1
@@ -544,14 +596,28 @@ class Database:
             "failed": 0,
         }
         for row in self._connection.execute(
-            "SELECT state, COUNT(*) AS count FROM delivery_jobs GROUP BY state"
+            """
+            SELECT j.state, COUNT(*) AS count
+            FROM delivery_jobs AS j
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM superseded_presence_jobs AS s
+                WHERE s.job_id = j.id
+            )
+            GROUP BY j.state
+            """
         ):
             counts[str(row["state"])] = int(row["count"])
         oldest = self._connection.execute(
             """
-            SELECT MIN(created_at) AS oldest
-            FROM delivery_jobs
-            WHERE state IN ('pending', 'leased')
+            SELECT MIN(j.created_at) AS oldest
+            FROM delivery_jobs AS j
+            WHERE j.state IN ('pending', 'leased')
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM superseded_presence_jobs AS s
+                  WHERE s.job_id = j.id
+              )
             """
         ).fetchone()
         oldest_value = oldest["oldest"] if oldest is not None else None

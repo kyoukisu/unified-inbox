@@ -24,14 +24,19 @@ class DeliveryWorker:
         max_attempts: int = 10,
         lease_seconds: float = 300,
         max_retry_seconds: float = 300,
+        worker_count: int = 4,
     ) -> None:
         self._db = db
         self._router = router
         self._max_attempts = max_attempts
         self._lease_seconds = lease_seconds
+        if worker_count < 1:
+            raise ValueError("worker_count must be positive")
         self._max_retry_seconds = max_retry_seconds
+        self._worker_count = worker_count
         self._wake_event = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
+        self._worker_tasks: list[asyncio.Task[None]] = []
         self._last_heartbeat = time.monotonic()
 
     @property
@@ -54,6 +59,7 @@ class DeliveryWorker:
         self._task.cancel()
         await asyncio.gather(self._task, return_exceptions=True)
         self._task = None
+        self._worker_tasks = []
 
     def wake(self) -> None:
         self._wake_event.set()
@@ -78,6 +84,30 @@ class DeliveryWorker:
         return True
 
     async def _run(self) -> None:
+        self._worker_tasks = [
+            asyncio.create_task(
+                self._run_worker(index),
+                name=f"delivery-worker-{index}",
+            )
+            for index in range(self._worker_count)
+        ]
+        try:
+            done, _ = await asyncio.wait(
+                self._worker_tasks,
+                return_when=asyncio.FIRST_EXCEPTION,
+            )
+            for task in done:
+                task.result()
+            await asyncio.gather(*self._worker_tasks)
+        finally:
+            current = asyncio.current_task()
+            for task in self._worker_tasks:
+                if task is not current and not task.done():
+                    task.cancel()
+            await asyncio.gather(*self._worker_tasks, return_exceptions=True)
+
+    async def _run_worker(self, worker_index: int) -> None:
+        del worker_index
         while True:
             processed = await self.run_once()
             if processed:

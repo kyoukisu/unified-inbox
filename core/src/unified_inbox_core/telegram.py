@@ -64,6 +64,10 @@ class TelegramClient:
         self._send_lock = asyncio.Lock()
         self._rate_tokens = 3.0
         self._rate_updated_at: float | None = None
+        self._topic_lock = asyncio.Lock()
+        self._topic_next_at = 0.0
+        self._reaction_lock = asyncio.Lock()
+        self._reaction_next_at = 0.0
 
     async def initialize_polling(self) -> None:
         await self.call("deleteWebhook", {"drop_pending_updates": False})
@@ -123,6 +127,7 @@ class TelegramClient:
         }
         if icon_custom_emoji_id is not None:
             payload["icon_custom_emoji_id"] = icon_custom_emoji_id
+        await self._wait_for_topic_slot()
         await self.call("editForumTopic", payload)
 
     async def close_topic(self, chat_id: int, topic_id: int) -> None:
@@ -256,7 +261,7 @@ class TelegramClient:
         return self._message_id(result)
 
     async def set_reaction(self, chat_id: int, message_id: int, emoji: str) -> None:
-        await self._wait_for_send_slot()
+        await self._wait_for_reaction_slot()
         await self.call(
             "setMessageReaction",
             {
@@ -448,6 +453,24 @@ class TelegramClient:
                 return b"".join(chunks)
         except (aiohttp.ClientError, TimeoutError) as exc:
             raise TelegramError("Telegram file download failed") from exc
+
+    async def _wait_for_topic_slot(self) -> None:
+        async with self._topic_lock:
+            loop = asyncio.get_running_loop()
+            now = loop.time()
+            delay = max(0.0, self._topic_next_at - now)
+            self._topic_next_at = max(now, self._topic_next_at) + 0.25
+            if delay:
+                await asyncio.sleep(delay)
+
+    async def _wait_for_reaction_slot(self) -> None:
+        async with self._reaction_lock:
+            loop = asyncio.get_running_loop()
+            now = loop.time()
+            delay = max(0.0, self._reaction_next_at - now)
+            self._reaction_next_at = max(now, self._reaction_next_at) + 0.25
+            if delay:
+                await asyncio.sleep(delay)
 
     async def _wait_for_send_slot(self) -> None:
         refill_rate = 20.0 / 60.0

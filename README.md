@@ -103,10 +103,11 @@ MAX_IMAGE_BYTES=20971520
 DELIVERY_MAX_ATTEMPTS=10
 DELIVERY_LEASE_SECONDS=300
 DELIVERY_RETRY_MAX_SECONDS=300
+DELIVERY_WORKERS=4
 STEAM_AUTH_MODE=qr
 ```
 
-`TELEGRAM_CHAT_ID` must be the numeric ID of the forum-supergroup. `TELEGRAM_ALLOWED_USER_ID` is the only Telegram account allowed to send external messages or commands.
+`TELEGRAM_CHAT_ID` must be the numeric ID of the forum-supergroup. `TELEGRAM_ALLOWED_USER_ID` is the only Telegram account allowed to send external messages or commands. `DELIVERY_WORKERS` controls bounded parallel delivery across independent conversations; ordering remains serialized within each conversation.
 
 ### 2. Configure Telegram
 

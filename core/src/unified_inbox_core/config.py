@@ -48,6 +48,7 @@ class Settings:
     delivery_max_attempts: int
     delivery_lease_seconds: int
     delivery_retry_max_seconds: int
+    delivery_workers: int
     log_level: str
 
     @classmethod
@@ -68,5 +69,6 @@ class Settings:
             delivery_max_attempts=int(os.environ.get("DELIVERY_MAX_ATTEMPTS", "10")),
             delivery_lease_seconds=int(os.environ.get("DELIVERY_LEASE_SECONDS", "300")),
             delivery_retry_max_seconds=int(os.environ.get("DELIVERY_RETRY_MAX_SECONDS", "300")),
+            delivery_workers=int(os.environ.get("DELIVERY_WORKERS", "4")),
             log_level=os.environ.get("CORE_LOG_LEVEL", "INFO").upper(),
         )

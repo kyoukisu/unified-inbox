@@ -59,6 +59,7 @@ class CoreApplication:
             max_attempts=settings.delivery_max_attempts,
             lease_seconds=settings.delivery_lease_seconds,
             max_retry_seconds=settings.delivery_retry_max_seconds,
+            worker_count=settings.delivery_workers,
         )
         self._poll_task: asyncio.Task[None] | None = None
         self._started_at = time.monotonic()

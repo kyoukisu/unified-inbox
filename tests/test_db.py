@@ -90,6 +90,31 @@ def test_failed_job_does_not_block_later_jobs(tmp_path: Path) -> None:
     db.close()
 
 
+def test_pending_presence_is_coalesced_per_conversation(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bridge.sqlite3")
+    first = db.enqueue_external_event(
+        "steam",
+        "presence-1",
+        "steam:alice",
+        '{"kind":"presence","status":"online"}',
+        coalesce_presence=True,
+    )
+    second = db.enqueue_external_event(
+        "steam",
+        "presence-2",
+        "steam:alice",
+        '{"kind":"presence","status":"offline"}',
+        coalesce_presence=True,
+    )
+
+    claimed = db.claim_next_job(300)
+
+    assert claimed is not None and claimed.id == second.job_id
+    assert db.job_counts()["pending"] == 0
+    assert first.job_id != second.job_id
+    db.close()
+
+
 def test_external_snapshots_and_telegram_delivery_ids_are_persisted(tmp_path: Path) -> None:
     db = Database(tmp_path / "bridge.sqlite3")
     conversation = db.create_conversation("discord", "dm-1", "Alice", 77)

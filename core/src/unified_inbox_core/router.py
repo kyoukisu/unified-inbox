@@ -69,6 +69,7 @@ class Router:
             event.event_id,
             self._conversation_key_values(event.platform, event.conversation_id),
             json.dumps(event.to_mapping(), ensure_ascii=False, separators=(",", ":")),
+            coalesce_presence=isinstance(event, PresenceEvent),
         )
 
     def enqueue_telegram_update(self, update: dict[str, object]) -> EnqueueResult:

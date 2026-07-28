@@ -251,7 +251,6 @@ client.on("loggedOn", () => {
   connected = true;
   historySyncPending = true;
   accountId = client.steamID?.getSteamID64() ?? null;
-  client.setPersona(SteamUser.EPersonaState.Invisible);
   if (reconnectWatchdog) clearTimeout(reconnectWatchdog);
   reconnectWatchdog = null;
   startPersonaRefresh();

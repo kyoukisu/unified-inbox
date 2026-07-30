@@ -40,7 +40,6 @@ const knownDisplayNames = new Map();
 const bufferedFriendMessages = [];
 const presenceSessionId = randomUUID();
 let presenceSequence = 0;
-let personaRefreshTimer = null;
 let personaRefreshRunning = false;
 let reconnectWatchdog = null;
 let historySyncPending = true;
@@ -141,14 +140,6 @@ async function refreshKnownSteamPersonas() {
   } finally {
     personaRefreshRunning = false;
   }
-}
-
-function startPersonaRefresh() {
-  if (personaRefreshTimer) clearInterval(personaRefreshTimer);
-  void refreshKnownSteamPersonas();
-  personaRefreshTimer = setInterval(() => {
-    void refreshKnownSteamPersonas();
-  }, 60000);
 }
 
 async function reconcileRecentFriendMessages() {
@@ -253,15 +244,13 @@ client.on("loggedOn", () => {
   accountId = client.steamID?.getSteamID64() ?? null;
   if (reconnectWatchdog) clearTimeout(reconnectWatchdog);
   reconnectWatchdog = null;
-  startPersonaRefresh();
+  void refreshKnownSteamPersonas();
   setTimeout(() => void reconcileRecentFriendMessages(), 2000);
   log("INFO", `Steam client connected as ${accountId}`);
 });
 client.on("disconnected", (result, message) => {
   connected = false;
   historySyncPending = true;
-  if (personaRefreshTimer) clearInterval(personaRefreshTimer);
-  personaRefreshTimer = null;
   if (reconnectWatchdog) clearTimeout(reconnectWatchdog);
   reconnectWatchdog = setTimeout(
     () => exitForSteamFailure("Steam reconnect watchdog expired"),
@@ -718,7 +707,6 @@ client.logOn({ refreshToken });
 async function shutdown() {
   if (shuttingDown) return;
   shuttingDown = true;
-  if (personaRefreshTimer) clearInterval(personaRefreshTimer);
   if (reconnectWatchdog) clearTimeout(reconnectWatchdog);
   server.close();
   client.logOff();

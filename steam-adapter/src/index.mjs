@@ -39,6 +39,7 @@ const lastPresence = new Map();
 const knownDisplayNames = new Map();
 const bufferedFriendMessages = [];
 const presenceSessionId = randomUUID();
+const shutdownController = new AbortController();
 let presenceSequence = 0;
 let personaRefreshRunning = false;
 let reconnectWatchdog = null;
@@ -70,7 +71,15 @@ function log(level, message, error = null) {
 }
 
 function sleep(milliseconds) {
-  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+  return new Promise((resolve) => {
+    const done = () => {
+      clearTimeout(timer);
+      shutdownController.signal.removeEventListener("abort", done);
+      resolve();
+    };
+    const timer = setTimeout(done, milliseconds);
+    shutdownController.signal.addEventListener("abort", done, { once: true });
+  });
 }
 
 function closeSpool() {
@@ -406,7 +415,10 @@ async function deliverPendingEvents() {
           "content-type": "application/json",
         },
         body: JSON.stringify(pending.payload),
-        signal: AbortSignal.timeout(90_000),
+        signal: AbortSignal.any([
+          shutdownController.signal,
+          AbortSignal.timeout(90_000),
+        ]),
       });
       if (!response.ok) {
         const error = `core returned HTTP ${response.status}: ${(
@@ -423,6 +435,7 @@ async function deliverPendingEvents() {
       spool.delete(pending.sequence);
       delay = 1000;
     } catch (error) {
+      if (shuttingDown) break;
       spool.failAttempt(pending.sequence, error instanceof Error ? error.message : String(error));
       log("WARN", `Steam event ${pending.eventId} remains queued`, error);
       await sleep(delay);
@@ -707,6 +720,7 @@ client.logOn({ refreshToken });
 async function shutdown() {
   if (shuttingDown) return;
   shuttingDown = true;
+  shutdownController.abort();
   if (reconnectWatchdog) clearTimeout(reconnectWatchdog);
   server.close();
   client.logOff();

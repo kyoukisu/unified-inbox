@@ -113,6 +113,7 @@ CREATE TABLE IF NOT EXISTS delivery_jobs (
     conversation_key TEXT NOT NULL,
     kind TEXT NOT NULL
         CHECK (kind IN ('route_external_event', 'route_telegram_update')),
+    priority INTEGER NOT NULL DEFAULT 0 CHECK (priority IN (0, 1)),
     state TEXT NOT NULL
         CHECK (state IN ('pending', 'leased', 'succeeded', 'failed')),
     attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
@@ -128,7 +129,7 @@ CREATE TABLE IF NOT EXISTS delivery_jobs (
 );
 
 CREATE INDEX IF NOT EXISTS delivery_jobs_runnable
-    ON delivery_jobs(state, available_at, id);
+    ON delivery_jobs(state, priority, available_at, id);
 CREATE INDEX IF NOT EXISTS delivery_jobs_conversation_order
     ON delivery_jobs(conversation_key, id, state);
 CREATE INDEX IF NOT EXISTS delivery_jobs_failures
@@ -168,7 +169,23 @@ class Database:
                 "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (4, ?)",
                 (now,),
             )
-            self._connection.execute("PRAGMA user_version = 4")
+            columns = {
+                str(row["name"])
+                for row in self._connection.execute("PRAGMA table_info(delivery_jobs)")
+            }
+            if "priority" not in columns:
+                self._connection.execute(
+                    "ALTER TABLE delivery_jobs ADD COLUMN priority INTEGER NOT NULL DEFAULT 0"
+                )
+            self._connection.execute(
+                "CREATE INDEX IF NOT EXISTS delivery_jobs_runnable_priority "
+                "ON delivery_jobs(state, priority, available_at, id)"
+            )
+            self._connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (5, ?)",
+                (now,),
+            )
+            self._connection.execute("PRAGMA user_version = 5")
 
     def close(self) -> None:
         self._connection.close()
@@ -191,6 +208,7 @@ class Database:
             telegram_message_id=None,
             telegram_offset=None,
             coalesce_presence=coalesce_presence,
+            priority=1 if coalesce_presence else 0,
         )
 
     def enqueue_telegram_update(
@@ -210,6 +228,7 @@ class Database:
             payload_json=payload_json,
             telegram_message_id=telegram_message_id,
             telegram_offset=next_offset,
+            priority=0,
         )
 
     def _enqueue(
@@ -223,6 +242,7 @@ class Database:
         payload_json: str,
         telegram_message_id: int | None,
         telegram_offset: int | None,
+        priority: int,
         coalesce_presence: bool = False,
     ) -> EnqueueResult:
         now = time.time()
@@ -278,12 +298,12 @@ class Database:
                     job_cursor = self._connection.execute(
                         """
                         INSERT INTO delivery_jobs (
-                            ingress_event_id, conversation_key, kind, state,
+                            ingress_event_id, conversation_key, kind, priority, state,
                             attempt_count, available_at, lease_expires_at,
                             last_error, created_at, updated_at
-                        ) VALUES (?, ?, ?, 'pending', 0, ?, NULL, NULL, ?, ?)
+                        ) VALUES (?, ?, ?, ?, 'pending', 0, ?, NULL, NULL, ?, ?)
                         """,
-                        (ingress_id, conversation_key, job_kind, now, now, now),
+                        (ingress_id, conversation_key, job_kind, priority, now, now, now),
                     )
                     job_id = job_cursor.lastrowid
                     if job_id is None:
@@ -373,13 +393,14 @@ class Database:
                       WHERE earlier.conversation_key = j.conversation_key
                         AND earlier.id < j.id
                         AND earlier.state IN ('pending', 'leased')
+                        AND (j.priority = 1 OR earlier.priority = 0)
                         AND NOT EXISTS (
                             SELECT 1
                             FROM superseded_presence_jobs AS s
                             WHERE s.job_id = earlier.id
                         )
                   )
-                ORDER BY j.id
+                ORDER BY j.priority, j.id
                 LIMIT 1
                 """,
                 (current,),
@@ -620,10 +641,50 @@ class Database:
               )
             """
         ).fetchone()
+        now = time.time()
         oldest_value = oldest["oldest"] if oldest is not None else None
         counts["oldest_pending_age"] = (
-            max(0.0, time.time() - float(oldest_value)) if oldest_value is not None else None
+            max(0.0, now - float(oldest_value)) if oldest_value is not None else None
         )
+        for row in self._connection.execute(
+            """
+            SELECT e.source, j.state, COUNT(*) AS count, MIN(j.created_at) AS oldest
+            FROM delivery_jobs AS j
+            JOIN ingress_events AS e ON e.id = j.ingress_event_id
+            WHERE j.state IN ('pending', 'leased')
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM superseded_presence_jobs AS s
+                  WHERE s.job_id = j.id
+              )
+            GROUP BY e.source, j.state
+            """
+        ):
+            source = str(row["source"])
+            state = str(row["state"])
+            counts[f"{state}_{source}"] = int(row["count"])
+            oldest_source = row["oldest"]
+            if oldest_source is not None:
+                counts[f"oldest_{state}_{source}_age"] = max(
+                    0.0,
+                    now - float(oldest_source),
+                )
+        for row in self._connection.execute(
+            """
+            SELECT e.source, AVG(j.updated_at - j.created_at) AS average_latency
+            FROM delivery_jobs AS j
+            JOIN ingress_events AS e ON e.id = j.ingress_event_id
+            WHERE j.state = 'succeeded' AND j.updated_at >= ?
+            GROUP BY e.source
+            """,
+            (now - 300,),
+        ):
+            average_latency = row["average_latency"]
+            if average_latency is not None:
+                counts[f"average_delivery_latency_{row['source']!s}_5m"] = round(
+                    float(average_latency),
+                    3,
+                )
         counts["legacy_unrecoverable_events"] = self.legacy_failure_count()
         return counts
 

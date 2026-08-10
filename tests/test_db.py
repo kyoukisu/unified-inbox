@@ -115,6 +115,74 @@ def test_pending_presence_is_coalesced_per_conversation(tmp_path: Path) -> None:
     db.close()
 
 
+def test_message_jobs_are_prioritized_over_presence_jobs(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bridge.sqlite3")
+    presence = db.enqueue_external_event(
+        "steam",
+        "presence-1",
+        "steam:alice",
+        '{"kind":"presence","status":"online"}',
+        coalesce_presence=True,
+    )
+    message = db.enqueue_external_event(
+        "steam",
+        "message-1",
+        "steam:bob",
+        '{"kind":"message","text":"hello"}',
+    )
+
+    claimed = db.claim_next_job(300)
+
+    assert claimed is not None and claimed.id == message.job_id
+    db.complete_job(claimed)
+    claimed_presence = db.claim_next_job(300)
+    assert claimed_presence is not None and claimed_presence.id == presence.job_id
+    db.close()
+
+
+def test_presence_does_not_block_a_later_message_in_the_same_conversation(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bridge.sqlite3")
+    presence = db.enqueue_external_event(
+        "steam",
+        "presence-1",
+        "steam:alice",
+        '{"kind":"presence","status":"online"}',
+        coalesce_presence=True,
+    )
+    message = db.enqueue_external_event(
+        "steam",
+        "message-1",
+        "steam:alice",
+        '{"kind":"message","text":"hello"}',
+    )
+
+    claimed = db.claim_next_job(300)
+
+    assert claimed is not None and claimed.id == message.job_id
+    db.complete_job(claimed)
+    claimed_presence = db.claim_next_job(300)
+    assert claimed_presence is not None and claimed_presence.id == presence.job_id
+    db.close()
+
+
+def test_job_counts_include_per_source_queue_and_recent_latency(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bridge.sqlite3")
+    queued = db.enqueue_external_event("steam", "message-1", "steam:alice", "{}")
+
+    counts = db.job_counts()
+    assert counts["pending_steam"] == 1
+    assert isinstance(counts["oldest_pending_steam_age"], float)
+
+    claimed = db.claim_next_job(300)
+    assert claimed is not None and claimed.id == queued.job_id
+    db.complete_job(claimed)
+
+    counts = db.job_counts()
+    latency = counts["average_delivery_latency_steam_5m"]
+    assert latency is not None and latency >= 0
+    db.close()
+
+
 def test_external_snapshots_and_telegram_delivery_ids_are_persisted(tmp_path: Path) -> None:
     db = Database(tmp_path / "bridge.sqlite3")
     conversation = db.create_conversation("discord", "dm-1", "Alice", 77)
